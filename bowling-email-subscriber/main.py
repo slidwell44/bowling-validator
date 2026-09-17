@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
-from config import get_settings
+from config import Settings, get_settings
 
-settings = get_settings()
+settings: Settings = get_settings()
 
 
 def create_app() -> FastAPI:

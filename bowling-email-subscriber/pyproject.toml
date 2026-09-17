@@ -18,6 +18,12 @@ dependencies = [
 
 [tool]
 
+[tool.ruff]
+src = ["."]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
 [tool.pyrefly]
 project-includes = [
     "**/*.py*",
