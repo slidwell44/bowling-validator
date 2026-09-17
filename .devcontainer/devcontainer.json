@@ -21,7 +21,8 @@
                 "ms-python.python",
                 "ms-python.debugpy",
                 "meta.pyrefly",
-                "charliermarsh.ruff"
+                "charliermarsh.ruff",
+                "openai.chatgpt"
             ],
             "settings": {
                 "python.defaultInterpreterPath": "/home/vscode/.venvs/bowling-email-subscriber/bin/python",

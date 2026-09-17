@@ -7,5 +7,7 @@
     },
     "python.analysis.autoImportCompletions": true,
     "dev.containers.executeInWSL": false,
-    "dev.containers.forwardWSLServices": false
+    "dev.containers.forwardWSLServices": false,
+    "python.terminal.useEnvFile": true,
+    "python.envFile": "${workspaceFolder}/.env"
 }
