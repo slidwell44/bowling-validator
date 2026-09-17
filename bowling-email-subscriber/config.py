@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,7 +21,7 @@ class _GoogleSettings(BaseSettings):
     )
 
     CLIENT_ID: str
-    CLIENT_SECRET: str
+    CLIENT_SECRET: SecretStr
 
 
 class _OpenaiSettings(BaseSettings):
@@ -31,7 +31,7 @@ class _OpenaiSettings(BaseSettings):
         env_prefix="OPENAI_",
     )
 
-    API_KEY: str
+    API_KEY: SecretStr
 
 
 class Settings(BaseModel):
