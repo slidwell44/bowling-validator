@@ -1,6 +1,12 @@
-def main():
-    print("Hello from bowling-email-subscriber!")
+from fastapi import FastAPI
+
+def create_app() -> FastAPI:
+    app = FastAPI()
+    
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    
+    uvicorn.run("bowling-email-subscriber.main:create_app",)

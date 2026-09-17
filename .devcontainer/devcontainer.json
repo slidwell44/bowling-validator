@@ -1,0 +1,40 @@
+{
+    "name": "Bowling validator",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "vscode",
+    "postCreateCommand": "uv sync --locked --project bowling-email-subscriber",
+    "remoteEnv": {
+        "PATH": "/home/vscode/.venvs/bowling-email-subscriber/bin:${containerEnv:PATH}"
+    },
+    "forwardPorts": [8000],
+    "portsAttributes": {
+        "8000": {
+            "label": "FastAPI",
+            "onAutoForward": "notify"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.debugpy",
+                "meta.pyrefly",
+                "charliermarsh.ruff"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/home/vscode/.venvs/bowling-email-subscriber/bin/python",
+                "python.terminal.activateEnvironment": false,
+                "pyrefly.pyreflyExecutable": "from-environment",
+                "python.pyrefly.disableLanguageServices": false,
+                "python.pyrefly.disableTypeErrors": false,
+                "python.pyrefly.typeCheckingMode": "default",
+                "terminal.integrated.cwd": "${workspaceFolder}/bowling-email-subscriber",
+                "[python]": {
+                    "editor.defaultFormatter": "charliermarsh.ruff"
+                }
+            }
+        }
+    }
+}

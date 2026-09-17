@@ -1,4 +1,11 @@
 {
     "editor.fontFamily": "Cascadia Code",
-    "editor.fontSize": 16
+    "editor.fontSize": 16,
+    "python.pyrefly.disableLanguageServices": false,
+    "python.pyrefly.disabledLanguageServices": {
+        "completion": false
+    },
+    "python.analysis.autoImportCompletions": true,
+    "dev.containers.executeInWSL": false,
+    "dev.containers.forwardWSLServices": false
 }
