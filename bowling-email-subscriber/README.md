@@ -17,7 +17,7 @@ client, register `http://localhost:8080/` as an authorized redirect URI.
 From this directory, run:
 
 ```bash
-uv run python -m gmail_subscriber.oauth
+uv run python -m scripts.oauth
 ```
 
 Open the printed URL in your browser and approve Gmail read access. The command
@@ -31,7 +31,13 @@ through VS Code desktop). A public HTTPS forwarded URL is not the same callback.
 Alternatively, run this setup locally and securely copy the generated token file
 into this application directory on the server.
 
-Start the API as usual and call `/gmail-subscriber/labels`. The Google client
+Verify authorization and fetch label names and IDs directly:
+
+```bash
+uv run python -m scripts.labels
+```
+
+Or start the API as usual and call `/gmail-subscriber/labels`. The Google client
 uses the saved refresh token to obtain access tokens automatically. Run the setup
 command again if access is revoked. This setup authorizes one mailbox for the
 service; it does not implement per-user web login.

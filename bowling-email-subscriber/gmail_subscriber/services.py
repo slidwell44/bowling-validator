@@ -25,14 +25,14 @@ class GmailSubscriberService(BaseService):
     def credentials(self) -> Credentials:
         if not TOKEN_FILE.exists():
             raise RuntimeError(
-                "Gmail is not authorized. Run: python -m gmail_subscriber.oauth"
+                "Gmail is not authorized. Run: uv run python -m scripts.oauth"
             )
         credentials: Credentials = Credentials.from_authorized_user_file(
             str(TOKEN_FILE), SCOPES
         )
         if not credentials.refresh_token:
             raise RuntimeError(
-                "Gmail refresh token is missing. Run: python -m gmail_subscriber.oauth"
+                "Gmail refresh token is missing. Run: uv run python -m scripts.oauth"
             )
         return credentials
 

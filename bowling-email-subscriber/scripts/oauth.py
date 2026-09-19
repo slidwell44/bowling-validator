@@ -1,12 +1,15 @@
 import os
 from pathlib import Path
+from time import monotonic
 from typing import NewType
+from urllib.parse import parse_qs
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import google.auth.external_account_authorized_user
 import google.oauth2.credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from config import Settings
+from config import _GoogleSettings
 
 TOKEN_FILE: Path = Path(__file__).resolve().parents[1] / "gmail-token.json"
 SCOPES: list[str] = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -21,15 +24,68 @@ Oauth2Credentials = NewType(
 )
 
 
-def main() -> None:
-    from config import get_settings
+class _Callback:
+    def __init__(self) -> None:
+        self.state: str = ""
+        self.query: str | None = None
 
-    settings: Settings = get_settings()
+    def __call__(self, environ, start_response):
+        query = environ.get("QUERY_STRING", "")
+        params = parse_qs(query)
+        if (
+            environ["PATH_INFO"] != "/"
+            or params.get("state") != [self.state]
+            or not (params.get("code") or params.get("error"))
+        ):
+            start_response("400 Bad Request", [("Content-Type", "text/plain")])
+            return [
+                b"Not the current OAuth callback. Use the latest terminal authorization URL."
+            ]
+        self.query = query
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"Callback received. Check the terminal for the authorization result."]
+
+
+class _QuietHandler(WSGIRequestHandler):
+    def log_message(self, format, *args):
+        # Callback URLs contain authorization codes; keep them out of logs.
+        pass
+
+
+def authorize(flow: InstalledAppFlow, port: int = 8080, timeout: float = 300):
+    callback = _Callback()
+    with make_server(
+        "localhost", port, callback, handler_class=_QuietHandler
+    ) as server:
+        flow.redirect_uri = f"http://localhost:{server.server_port}/"
+        url, callback.state = flow.authorization_url(
+            access_type="offline", prompt="consent"
+        )
+        print(f"Please visit this URL to authorize this application: {url}", flush=True)
+        deadline = monotonic() + timeout
+        while callback.query is None:
+            server.timeout = max(0, deadline - monotonic())
+            if server.timeout == 0:
+                raise TimeoutError(
+                    "No matching Google callback arrived. Forward port 8080 to localhost:8080 "
+                    "on your browser's machine, rerun, and open the newly printed URL."
+                )
+            server.handle_request()
+
+    # Match the library's loopback HTTPS normalization for OAuthlib's URI parser.
+    flow.fetch_token(
+        authorization_response=f"https://localhost:{server.server_port}/?{callback.query}"
+    )
+    return flow.credentials
+
+
+def main() -> None:
+    settings = _GoogleSettings()
     flow: InstalledAppFlow = InstalledAppFlow.from_client_config(
         {
             "installed": {
-                "client_id": settings.google.CLIENT_ID,
-                "client_secret": settings.google.CLIENT_SECRET.get_secret_value(),
+                "client_id": settings.CLIENT_ID,
+                "client_secret": settings.CLIENT_SECRET.get_secret_value(),
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "redirect_uris": ["http://localhost:8080/"],
@@ -37,14 +93,7 @@ def main() -> None:
         },
         SCOPES,
     )
-    credentials: ExternalCredentials | Oauth2Credentials = flow.run_local_server(
-        host="localhost",
-        port=8080,
-        open_browser=False,
-        access_type="offline",
-        prompt="consent",
-        timeout_seconds=300,
-    )
+    credentials: ExternalCredentials | Oauth2Credentials = authorize(flow)
     if not credentials.refresh_token:
         raise RuntimeError("Google did not return a refresh token; no file was saved.")
 
