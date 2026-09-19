@@ -1,23 +1,30 @@
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
-from config import get_settings
+from config import ApplicationSettings
 
-settings = get_settings()
+settings = ApplicationSettings()
 
 
 def create_app() -> FastAPI:
+    from gmail_subscriber.endpoints import router as gmail_router
+
     app = FastAPI(
-        title=settings.app.NAME,
-        version=settings.app.VERSION,
+        title=settings.NAME,
+        version=settings.VERSION,
     )
 
     @app.get("/hello")
-    async def hello():
+    async def hello() -> dict[str, str]:
         return {"message": "Hello, World!"}
 
     @app.get("/", include_in_schema=False)
-    async def redirect_root():
+    async def redirect_root() -> RedirectResponse:
         return RedirectResponse("/docs")
 
+    app.include_router(gmail_router)
+
     return app
+
+
+app = create_app()

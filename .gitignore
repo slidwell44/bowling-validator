@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Gmail user authorization tokens
+gmail-token.json
+gmail-history.sqlite3*
