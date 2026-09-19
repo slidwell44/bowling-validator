@@ -1,7 +1,9 @@
 import base64
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -60,12 +62,11 @@ class NotificationTests(unittest.TestCase):
             {"history": [{"messagesAdded": [added]}], "historyId": "20"},
         ]
         self.gmail.users().messages().get().execute.return_value = {"raw": raw_email()}
-        with self.assertLogs("gmail_subscriber.services", level="INFO") as logs:
+        output = io.StringIO()
+        with redirect_stdout(output):
             process_notification(self.gmail, "user@example.com", "15", path=self.path)
             process_notification(self.gmail, "user@example.com", "15", path=self.path)
-        self.assertEqual(
-            sum("--- Gmail message" in message for message in logs.output), 1
-        )
+        self.assertEqual(output.getvalue().count("--- Gmail message"), 1)
         self.assertEqual(self.gmail.users().history().list().execute.call_count, 2)
         with history_state(self.path) as state:
             row = state.execute("SELECT history_id FROM mailbox").fetchone()

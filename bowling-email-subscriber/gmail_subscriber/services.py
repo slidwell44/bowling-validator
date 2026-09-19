@@ -233,10 +233,9 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                         raise
                     body = matching_body(raw)
                     if body is not None:
-                        logger.info(
-                            "--- Gmail message %s: Test ---\n%s",
-                            message_id,
-                            body,
+                        print(
+                            f"\n--- Gmail message {message_id}: Test ---\n{body}\n",
+                            flush=True,
                         )
             page_token = page.get("nextPageToken")
             if not page_token:
