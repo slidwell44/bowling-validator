@@ -150,18 +150,18 @@ class NotificationTests(unittest.TestCase):
 
 class PushTests(unittest.TestCase):
     def test_service_provider_reuses_service(self):
-        from gmail_subscriber.dependencies import get_gmail_subscriber_service
+        from gmail_subscriber.dependencies import get_gmail_service
 
-        with patch("gmail_subscriber.dependencies.GmailSubscriberService") as service:
-            get_gmail_subscriber_service.cache_clear()
-            self.assertIs(
-                get_gmail_subscriber_service(), get_gmail_subscriber_service()
-            )
+        with patch(
+            "gmail_subscriber.dependencies.GmailSubscriberService.create_gmail_service"
+        ) as service:
+            get_gmail_service.cache_clear()
+            self.assertIs(get_gmail_service(), get_gmail_service())
             service.assert_called_once_with()
-            get_gmail_subscriber_service.cache_clear()
+            get_gmail_service.cache_clear()
 
     def test_cloud_state_requires_database(self):
-        with patch("gmail_subscriber.services.GmailSettings") as settings:
+        with patch("gmail_subscriber.repositories.GmailSettings") as settings:
             settings.return_value.TOKEN_JSON = "configured"
             settings.return_value.DATABASE_URL = None
             with self.assertRaisesRegex(RuntimeError, "DATABASE_URL"), history_state():
@@ -169,8 +169,8 @@ class PushTests(unittest.TestCase):
 
     def test_postgres_lock_and_rollback(self):
         with (
-            patch("gmail_subscriber.services.GmailSettings") as settings,
-            patch("gmail_subscriber.services.psycopg.connect") as connect,
+            patch("gmail_subscriber.repositories.GmailSettings") as settings,
+            patch("gmail_subscriber.repositories.psycopg.connect") as connect,
         ):
             settings.return_value.DATABASE_URL.get_secret_value.return_value = (
                 "postgresql://test"

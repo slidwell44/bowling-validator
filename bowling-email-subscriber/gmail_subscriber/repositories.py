@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import psycopg
+
+from config import GmailSettings
+
+STATE_FILE = Path(__file__).resolve().parents[1] / "gmail-history.sqlite3"
 
 
 class MailboxRepository:
@@ -20,6 +27,33 @@ class MailboxRepository:
             "subject TEXT NOT NULL, body TEXT NOT NULL, history_id TEXT NOT NULL, "
             "processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
+
+    @classmethod
+    @contextmanager
+    def from_settings(cls, path=STATE_FILE):
+        settings = GmailSettings()
+        database_url = settings.DATABASE_URL
+        if settings.TOKEN_JSON and not database_url:
+            raise RuntimeError("DATABASE_URL is required with cloud Gmail credentials")
+        connection = (
+            psycopg.connect(database_url.get_secret_value(), connect_timeout=10)
+            if database_url
+            else sqlite3.connect(path, timeout=30)
+        )
+        try:
+            if database_url:
+                connection.execute("SELECT pg_advisory_xact_lock(724938201)")
+            repository = cls(connection)
+            repository.create_tables()
+            if not database_url:
+                connection.execute("BEGIN IMMEDIATE")
+            yield repository
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def get_history_id(self, email: str) -> str | None:
         row = self._execute(

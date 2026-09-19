@@ -4,15 +4,12 @@ import base64
 import json
 import logging
 import secrets
-import sqlite3
 from contextlib import contextmanager
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-import psycopg
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
 from google.oauth2.credentials import Credentials
@@ -20,7 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from config import GmailSettings
-from gmail_subscriber.repositories import MailboxRepository
+from gmail_subscriber.repositories import STATE_FILE, MailboxRepository
 from scripts.oauth import SCOPES, TOKEN_FILE
 
 if TYPE_CHECKING:
@@ -29,13 +26,40 @@ if TYPE_CHECKING:
 
 
 class GmailSubscriberService:
-    def __init__(self) -> None:
-        self._gmail_service: GmailResource = build(
+    def __init__(
+        self, repository: MailboxRepository, gmail_service: GmailResource
+    ) -> None:
+        self.repository = repository
+        self._gmail_service = gmail_service
+
+    @staticmethod
+    def create_gmail_service() -> GmailResource:
+        return build(
             "gmail",
             "v1",
-            credentials=self.credentials,
+            credentials=GmailSubscriberService.load_credentials(),
             cache_discovery=False,
         )
+
+    @staticmethod
+    def load_credentials() -> Credentials:
+        token_json = GmailSettings().TOKEN_JSON
+        if token_json:
+            return Credentials.from_authorized_user_info(
+                json.loads(token_json.get_secret_value()), SCOPES
+            )
+        if not TOKEN_FILE.exists():
+            raise RuntimeError(
+                "Gmail is not authorized. Run: uv run python -m scripts.oauth"
+            )
+        credentials: Credentials = Credentials.from_authorized_user_file(
+            str(TOKEN_FILE), SCOPES
+        )
+        if not credentials.refresh_token:
+            raise RuntimeError(
+                "Gmail refresh token is missing. Run: uv run python -m scripts.oauth"
+            )
+        return credentials
 
     @staticmethod
     def verify_identity(token: str, *, watch: bool = False) -> None:
@@ -58,10 +82,10 @@ class GmailSubscriberService:
         )
 
     def start_watch(self):
-        return start_watch(self.gmail, GmailSettings().PUBSUB_TOPIC)
+        return start_watch(self.gmail, GmailSettings().PUBSUB_TOPIC, self.repository)
 
     def process_notification(self, email: str, history_id: str):
-        return process_notification(self.gmail, email, history_id)
+        return process_notification(self.gmail, email, history_id, self.repository)
 
     @property
     def gmail(self) -> GmailResource:
@@ -69,23 +93,7 @@ class GmailSubscriberService:
 
     @property
     def credentials(self) -> Credentials:
-        token_json = GmailSettings().TOKEN_JSON
-        if token_json:
-            return Credentials.from_authorized_user_info(
-                json.loads(token_json.get_secret_value()), SCOPES
-            )
-        if not TOKEN_FILE.exists():
-            raise RuntimeError(
-                "Gmail is not authorized. Run: uv run python -m scripts.oauth"
-            )
-        credentials: Credentials = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE), SCOPES
-        )
-        if not credentials.refresh_token:
-            raise RuntimeError(
-                "Gmail refresh token is missing. Run: uv run python -m scripts.oauth"
-            )
-        return credentials
+        return self.load_credentials()
 
     def fetch_gmail_labels(self) -> list[Label]:
         results: ListLabelsResponse = (
@@ -95,7 +103,6 @@ class GmailSubscriberService:
         return labels
 
 
-STATE_FILE = Path(__file__).resolve().parents[1] / "gmail-history.sqlite3"
 SUBJECT_MARKER = "Substitute bowler request"
 TEST_SUBJECT = "Test"
 logger = logging.getLogger(__name__)
@@ -124,34 +131,19 @@ def decoded_subject(value: str) -> str:
 
 @contextmanager
 def history_state(path=STATE_FILE):
-    settings = GmailSettings()
-    database_url = settings.DATABASE_URL
-    if settings.TOKEN_JSON and not database_url:
-        raise RuntimeError("DATABASE_URL is required with cloud Gmail credentials")
-    connection = (
-        psycopg.connect(database_url.get_secret_value(), connect_timeout=10)
-        if database_url
-        else sqlite3.connect(path, timeout=30)
-    )
-    try:
-        if database_url:
-            # Serialize watch registration and deliveries across cloud instances.
-            connection.execute("SELECT pg_advisory_xact_lock(724938201)")
-        MailboxRepository(connection).create_tables()
-        if not database_url:
-            connection.execute("BEGIN IMMEDIATE")
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    with MailboxRepository.from_settings(path) as repository:
+        yield repository.connection
 
 
-def start_watch(gmail, topic: str, *, reset_history=False, path=STATE_FILE):
-    with history_state(path) as state:
-        repository = MailboxRepository(state)
+def start_watch(
+    gmail, topic: str, repository=None, *, reset_history=False, path=STATE_FILE
+):
+    if repository is None:
+        with MailboxRepository.from_settings(path) as repository_context:
+            return start_watch(
+                gmail, topic, repository_context, reset_history=reset_history
+            )
+    else:
         email = gmail.users().getProfile(userId="me").execute()["emailAddress"]
         result = (
             gmail.users()
@@ -171,10 +163,14 @@ def start_watch(gmail, topic: str, *, reset_history=False, path=STATE_FILE):
     return result
 
 
-def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE):
+def process_notification(
+    gmail, email: str, history_id: str, repository=None, *, path=STATE_FILE
+):
     # Serialize deliveries and persist progress only after every page succeeds.
-    with history_state(path) as state:
-        repository = MailboxRepository(state)
+    if repository is None:
+        with MailboxRepository.from_settings(path) as repository_context:
+            return process_notification(gmail, email, history_id, repository_context)
+    else:
         cursor = repository.get_history_id(email)
         if cursor is None:
             raise RuntimeError(

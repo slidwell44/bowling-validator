@@ -2,6 +2,7 @@ import argparse
 from datetime import UTC, datetime
 
 from config import GmailSettings
+from gmail_subscriber.repositories import MailboxRepository
 from gmail_subscriber.services import GmailSubscriberService, start_watch
 
 
@@ -15,11 +16,13 @@ def main():
         help="Discard saved progress and start from now",
     )
     args = parser.parse_args()
-    result = start_watch(
-        GmailSubscriberService().gmail,
-        GmailSettings().PUBSUB_TOPIC,
-        reset_history=args.reset_history,
-    )
+    with MailboxRepository.from_settings() as repository:
+        result = start_watch(
+            GmailSubscriberService.create_gmail_service(),
+            GmailSettings().PUBSUB_TOPIC,
+            repository,
+            reset_history=args.reset_history,
+        )
     expiration = datetime.fromtimestamp(int(result["expiration"]) / 1000, UTC)
     print(
         f"Gmail watch active until {expiration.isoformat()}. Renew daily with this command."
