@@ -72,9 +72,6 @@ def fetch_gmail_labels(
 @router.post("/push", status_code=204, dependencies=[Depends(require_push_identity)])
 def receive_push(
     envelope: PubSubEnvelope,
-    service: Annotated[
-        GmailSubscriberService, Depends(provide_gmail_subscriber_service)
-    ],
 ):
     try:
         notification = GmailNotification.model_validate_json(
@@ -90,6 +87,7 @@ def receive_push(
         notification.emailAddress,
         notification.historyId,
     )
+    service = GmailSubscriberService()
     service.process_notification(notification.emailAddress, notification.historyId)
     logger.info("Processed Gmail push notification for %s", notification.emailAddress)
     return Response(status_code=204)

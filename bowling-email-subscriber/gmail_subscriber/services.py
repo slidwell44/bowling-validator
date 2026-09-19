@@ -19,6 +19,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from config import GmailSettings
+from gmail_subscriber.repositories import MailboxRepository
 from scripts.oauth import SCOPES, TOKEN_FILE
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class GmailSubscriberService:
             "gmail",
             "v1",
             credentials=self.credentials,
+            cache_discovery=False,
         )
 
     @staticmethod
@@ -121,10 +123,7 @@ def history_state(path=STATE_FILE):
         if database_url:
             # Serialize watch registration and deliveries across cloud instances.
             connection.execute("SELECT pg_advisory_xact_lock(724938201)")
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS mailbox "
-            "(email TEXT PRIMARY KEY, history_id TEXT NOT NULL)"
-        )
+        MailboxRepository(connection).create_tables()
         if not database_url:
             connection.execute("BEGIN IMMEDIATE")
         yield connection
@@ -136,14 +135,9 @@ def history_state(path=STATE_FILE):
         connection.close()
 
 
-def _execute(connection, query, parameters):
-    if isinstance(connection, psycopg.Connection):
-        query = query.replace("?", "%s")
-    return connection.execute(query, parameters)
-
-
 def start_watch(gmail, topic: str, *, reset_history=False, path=STATE_FILE):
     with history_state(path) as state:
+        repository = MailboxRepository(state)
         email = gmail.users().getProfile(userId="me").execute()["emailAddress"]
         result = (
             gmail.users()
@@ -158,38 +152,33 @@ def start_watch(gmail, topic: str, *, reset_history=False, path=STATE_FILE):
             .execute()
         )
         if reset_history:
-            _execute(state, "DELETE FROM mailbox WHERE email = ?", (email,))
-        _execute(
-            state,
-            "INSERT INTO mailbox VALUES (?, ?) ON CONFLICT (email) DO NOTHING",
-            (email, result["historyId"]),
-        )
+            repository.reset_history(email)
+        repository.save_initial_history(email, result["historyId"])
     return result
 
 
 def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE):
     # Serialize deliveries and persist progress only after every page succeeds.
     with history_state(path) as state:
-        row = _execute(
-            state, "SELECT history_id FROM mailbox WHERE email = ?", (email,)
-        ).fetchone()
-        if row is None:
+        repository = MailboxRepository(state)
+        cursor = repository.get_history_id(email)
+        if cursor is None:
             raise RuntimeError(
                 "Mailbox watch is not initialized. Run python -m scripts.watch."
             )
-        if int(history_id) <= int(row[0]):
+        if int(history_id) <= int(cursor):
             logger.info(
                 "Skipping Gmail history %s for %s; cursor is already %s",
                 history_id,
                 email,
-                row[0],
+                cursor,
             )
             return
         logger.info(
             "Processing Gmail history %s for %s from cursor %s",
             history_id,
             email,
-            row[0],
+            cursor,
         )
         page_token = None
         seen = set()
@@ -200,7 +189,7 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                     .history()
                     .list(
                         userId="me",
-                        startHistoryId=row[0],
+                        startHistoryId=cursor,
                         historyTypes=["messageAdded"],
                         pageToken=page_token,
                     )
@@ -221,6 +210,32 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                         continue
                     seen.add(message_id)
                     try:
+                        metadata = (
+                            gmail.users()
+                            .messages()
+                            .get(
+                                userId="me",
+                                id=message_id,
+                                format="metadata",
+                                metadataHeaders=["Subject"],
+                            )
+                            .execute()
+                        )
+                    except HttpError as exc:
+                        if exc.resp.status == 404:
+                            continue  # The message was deleted before delivery.
+                        raise
+                    subject = next(
+                        (
+                            header["value"]
+                            for header in metadata.get("payload", {}).get("headers", [])
+                            if header.get("name", "").lower() == "subject"
+                        ),
+                        "",
+                    )
+                    if subject != "Test":
+                        continue
+                    try:
                         raw = (
                             gmail.users()
                             .messages()
@@ -232,18 +247,16 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                             continue  # The message was deleted before delivery.
                         raise
                     body = matching_body(raw)
-                    if body is not None:
+                    if body is not None and repository.record_processed_message(
+                        message_id, email, subject, body, history_id
+                    ):
                         print(
                             f"\n--- Gmail message {message_id}: Test ---\n{body}\n",
                             flush=True,
                         )
             page_token = page.get("nextPageToken")
             if not page_token:
-                _execute(
-                    state,
-                    "UPDATE mailbox SET history_id = ? WHERE email = ?",
-                    (page["historyId"], email),
-                )
+                repository.update_history(email, page["historyId"])
                 logger.info(
                     "Advanced Gmail history cursor for %s to %s",
                     email,

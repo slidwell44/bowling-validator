@@ -126,6 +126,22 @@ gcloud scheduler jobs run gmail-watch-renew --location=us-central1
 The watch endpoint should return HTTP 200 with a `historyId` and expiration.
 Register the watch on the deployed endpoint so its cursor is stored in Neon.
 
+The application creates these tables automatically in the configured database:
+
+- `mailbox` stores the Gmail history cursor for the watched mailbox.
+- `processed_messages` stores each successfully processed `Test` message,
+  including its Gmail message ID, mailbox, subject, body, history ID, and
+  processing timestamp. The message ID is unique, so Pub/Sub retries do not
+  create duplicate history rows or duplicate body output.
+
+You can inspect the history from Neon SQL Editor:
+
+```sql
+SELECT message_id, mailbox_email, subject, body, processed_at
+FROM processed_messages
+ORDER BY processed_at DESC;
+```
+
 ## Behavior and recovery
 
 The watch observes new `INBOX` messages. The application logs the body only

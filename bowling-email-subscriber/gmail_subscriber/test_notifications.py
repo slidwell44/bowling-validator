@@ -61,7 +61,10 @@ class NotificationTests(unittest.TestCase):
             {"history": [{"messagesAdded": [added, sent]}], "nextPageToken": "next"},
             {"history": [{"messagesAdded": [added]}], "historyId": "20"},
         ]
-        self.gmail.users().messages().get().execute.return_value = {"raw": raw_email()}
+        self.gmail.users().messages().get().execute.side_effect = [
+            {"payload": {"headers": [{"name": "Subject", "value": "Test"}]}},
+            {"raw": raw_email()},
+        ]
         output = io.StringIO()
         with redirect_stdout(output):
             process_notification(self.gmail, "user@example.com", "15", path=self.path)
@@ -74,6 +77,20 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(
                 row[0],
                 "20",
+            )
+            processed = state.execute(
+                "SELECT message_id, mailbox_email, subject, body, history_id "
+                "FROM processed_messages"
+            ).fetchone()
+            self.assertEqual(
+                processed,
+                (
+                    "one",
+                    "user@example.com",
+                    "Test",
+                    "Plain body with unicode: café\n",
+                    "15",
+                ),
             )
 
     def test_failure_does_not_advance_cursor(self):
@@ -145,21 +162,26 @@ class PushTests(unittest.TestCase):
             connection.close.assert_called_once()
 
     def test_authentication_payload_and_retry(self):
-        from gmail_subscriber.dependencies import provide_gmail_subscriber_service
 
         app = FastAPI()
         app.include_router(router)
         service = MagicMock()
-        app.dependency_overrides[provide_gmail_subscriber_service] = lambda: service
         client = TestClient(app, raise_server_exceptions=False)
         data = base64.b64encode(
             json.dumps({"emailAddress": "user@example.com", "historyId": "15"}).encode()
         ).decode()
         envelope = {"message": {"data": data}}
         headers = {"Authorization": "Bearer token"}
-        with patch(
-            "gmail_subscriber.services.GmailSubscriberService.verify_identity"
-        ) as verify:
+        with (
+            patch(
+                "gmail_subscriber.services.GmailSubscriberService.verify_identity"
+            ) as verify,
+            patch(
+                "gmail_subscriber.endpoints.GmailSubscriberService",
+                return_value=service,
+            ) as service_class,
+        ):
+            service_class.verify_identity = verify
             self.assertEqual(
                 client.post("/gmail-subscriber/push", json=envelope).status_code, 401
             )
