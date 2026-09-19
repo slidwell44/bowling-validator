@@ -149,6 +149,17 @@ class NotificationTests(unittest.TestCase):
 
 
 class PushTests(unittest.TestCase):
+    def test_service_provider_reuses_service(self):
+        from gmail_subscriber.dependencies import get_gmail_subscriber_service
+
+        with patch("gmail_subscriber.dependencies.GmailSubscriberService") as service:
+            get_gmail_subscriber_service.cache_clear()
+            self.assertIs(
+                get_gmail_subscriber_service(), get_gmail_subscriber_service()
+            )
+            service.assert_called_once_with()
+            get_gmail_subscriber_service.cache_clear()
+
     def test_cloud_state_requires_database(self):
         with patch("gmail_subscriber.services.GmailSettings") as settings:
             settings.return_value.TOKEN_JSON = "configured"
@@ -178,10 +189,12 @@ class PushTests(unittest.TestCase):
             connection.close.assert_called_once()
 
     def test_authentication_payload_and_retry(self):
+        from gmail_subscriber.dependencies import provide_gmail_subscriber_service
 
         app = FastAPI()
         app.include_router(router)
         service = MagicMock()
+        app.dependency_overrides[provide_gmail_subscriber_service] = lambda: service
         client = TestClient(app, raise_server_exceptions=False)
         data = base64.b64encode(
             json.dumps({"emailAddress": "user@example.com", "historyId": "15"}).encode()
@@ -192,12 +205,7 @@ class PushTests(unittest.TestCase):
             patch(
                 "gmail_subscriber.services.GmailSubscriberService.verify_identity"
             ) as verify,
-            patch(
-                "gmail_subscriber.endpoints.GmailSubscriberService",
-                return_value=service,
-            ) as service_class,
         ):
-            service_class.verify_identity = verify
             self.assertEqual(
                 client.post("/gmail-subscriber/push", json=envelope).status_code, 401
             )
