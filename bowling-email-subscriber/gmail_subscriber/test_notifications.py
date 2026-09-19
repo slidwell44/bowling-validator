@@ -14,13 +14,14 @@ from fastapi.testclient import TestClient
 from gmail_subscriber.endpoints import router
 from gmail_subscriber.services import (
     history_state,
+    is_relevant_subject,
     matching_body,
     process_notification,
     start_watch,
 )
 
 
-def raw_email(subject="Test"):
+def raw_email(subject="Substitute bowler request"):
     message = EmailMessage()
     message["Subject"] = subject
     message.set_content("Plain body with unicode: caf\u00e9")
@@ -35,14 +36,23 @@ def raw_email(subject="Test"):
 
 
 class NotificationTests(unittest.TestCase):
-    def test_mime_body_and_exact_subject(self):
+    def test_mime_body_and_subject_marker(self):
         self.assertEqual(
             matching_body(raw_email()), "Plain body with unicode: caf\u00e9\n"
         )
+        self.assertEqual(
+            matching_body(raw_email("New Substitute Bowler Request - Tuesday")),
+            "Plain body with unicode: café\n",
+        )
+        self.assertEqual(
+            matching_body(raw_email("Test")), "Plain body with unicode: café\n"
+        )
         self.assertIsNone(matching_body(raw_email("Re: Test")))
-        self.assertIsNone(matching_body(raw_email("test")))
+        self.assertTrue(is_relevant_subject("Test"))
+        self.assertTrue(is_relevant_subject("New substitute bowler request"))
+        self.assertFalse(is_relevant_subject("Re: Test"))
         raw = base64.urlsafe_b64encode(
-            b"Subject: =?utf-8?q?Test?=\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>"
+            b"Subject: =?utf-8?q?Substitute_bowler_request?=\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>"
         ).decode()
         self.assertEqual(matching_body(raw), "<p>Hello</p>")
 
@@ -62,7 +72,13 @@ class NotificationTests(unittest.TestCase):
             {"history": [{"messagesAdded": [added]}], "historyId": "20"},
         ]
         self.gmail.users().messages().get().execute.side_effect = [
-            {"payload": {"headers": [{"name": "Subject", "value": "Test"}]}},
+            {
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Substitute bowler request"}
+                    ]
+                }
+            },
             {"raw": raw_email()},
         ]
         output = io.StringIO()
@@ -87,7 +103,7 @@ class NotificationTests(unittest.TestCase):
                 (
                     "one",
                     "user@example.com",
-                    "Test",
+                    "Substitute bowler request",
                     "Plain body with unicode: café\n",
                     "15",
                 ),

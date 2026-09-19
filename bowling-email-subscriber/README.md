@@ -11,8 +11,9 @@ It provides:
 - authenticated Pub/Sub delivery at `/gmail-subscriber/push`.
 
 The service tracks Gmail history in PostgreSQL in production and SQLite during
-local development. It currently logs the body of new inbox messages whose
-subject is exactly `Test`; form automation is planned but not implemented.
+local development. It logs the body of new inbox messages whose subject is
+exactly `Test` or contains `Substitute bowler request`; form automation is
+planned but not implemented.
 
 See [Google Cloud setup](docs/google-cloud.md) for OAuth, Gmail, Pub/Sub,
 Neon, FastAPI Cloud, and Cloud Scheduler configuration.

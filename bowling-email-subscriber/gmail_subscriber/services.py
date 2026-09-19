@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 from contextlib import contextmanager
 from email import policy
+from email.header import decode_header, make_header
 from email.parser import BytesParser
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -95,17 +96,30 @@ class GmailSubscriberService:
 
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "gmail-history.sqlite3"
+SUBJECT_MARKER = "Substitute bowler request"
+TEST_SUBJECT = "Test"
 logger = logging.getLogger(__name__)
+
+
+def is_relevant_subject(subject: str) -> bool:
+    normalized = subject.casefold()
+    return (
+        normalized == TEST_SUBJECT.casefold() or SUBJECT_MARKER.casefold() in normalized
+    )
 
 
 def matching_body(raw: str) -> str | None:
     message = BytesParser(policy=policy.default).parsebytes(
         base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
     )
-    if str(message.get("Subject", "")) != "Test":
+    if not is_relevant_subject(str(message.get("Subject", ""))):
         return None
     body = message.get_body(preferencelist=("plain", "html"))
     return body.get_content() if body is not None else ""
+
+
+def decoded_subject(value: str) -> str:
+    return str(make_header(decode_header(value)))
 
 
 @contextmanager
@@ -225,15 +239,19 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                         if exc.resp.status == 404:
                             continue  # The message was deleted before delivery.
                         raise
-                    subject = next(
-                        (
-                            header["value"]
-                            for header in metadata.get("payload", {}).get("headers", [])
-                            if header.get("name", "").lower() == "subject"
-                        ),
-                        "",
+                    subject = decoded_subject(
+                        next(
+                            (
+                                header["value"]
+                                for header in metadata.get("payload", {}).get(
+                                    "headers", []
+                                )
+                                if header.get("name", "").lower() == "subject"
+                            ),
+                            "",
+                        )
                     )
-                    if subject != "Test":
+                    if not is_relevant_subject(subject):
                         continue
                     try:
                         raw = (
@@ -251,7 +269,7 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                         message_id, email, subject, body, history_id
                     ):
                         print(
-                            f"\n--- Gmail message {message_id}: Test ---\n{body}\n",
+                            f"\n--- Gmail message {message_id}: {subject} ---\n{body}\n",
                             flush=True,
                         )
             page_token = page.get("nextPageToken")

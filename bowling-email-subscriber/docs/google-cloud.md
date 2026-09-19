@@ -129,10 +129,10 @@ Register the watch on the deployed endpoint so its cursor is stored in Neon.
 The application creates these tables automatically in the configured database:
 
 - `mailbox` stores the Gmail history cursor for the watched mailbox.
-- `processed_messages` stores each successfully processed `Test` message,
-  including its Gmail message ID, mailbox, subject, body, history ID, and
-  processing timestamp. The message ID is unique, so Pub/Sub retries do not
-  create duplicate history rows or duplicate body output.
+- `processed_messages` stores each successfully processed substitute-bowler
+  request, including its Gmail message ID, mailbox, subject, body, history ID,
+  and processing timestamp. The message ID is unique, so Pub/Sub retries do
+  not create duplicate history rows or duplicate body output.
 
 You can inspect the history from Neon SQL Editor:
 
@@ -144,10 +144,11 @@ ORDER BY processed_at DESC;
 
 ## Behavior and recovery
 
-The watch observes new `INBOX` messages. The application logs the body only
-when the subject is exactly `Test`, preferring plain text and falling back to
-HTML source. Pub/Sub notifications contain mailbox history, not the email
-subject, so Pub/Sub filters cannot filter by subject or body.
+The watch observes new `INBOX` messages. The application logs the body when the
+`Subject` header is exactly `Test` or contains `Substitute bowler request`,
+case-insensitively. It prefers plain text and falls back to HTML source.
+Pub/Sub notifications contain mailbox history, not the email subject, so
+Pub/Sub filters cannot filter by subject or body.
 
 HTTP 204 acknowledges a notification. Non-success responses cause Pub/Sub to
 retry. PostgreSQL preserves the cursor across deployments and serializes
