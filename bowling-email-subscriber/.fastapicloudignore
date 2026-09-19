@@ -1,0 +1,6 @@
+.env
+.env.*
+gmail-token.json
+gmail-history.sqlite3*
+**/__pycache__/
+.venv/

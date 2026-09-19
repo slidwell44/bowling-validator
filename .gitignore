@@ -219,3 +219,4 @@ __marimo__/
 
 # Gmail user authorization tokens
 gmail-token.json
+gmail-history.sqlite3*

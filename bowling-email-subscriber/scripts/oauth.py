@@ -1,27 +1,15 @@
 import os
 from pathlib import Path
 from time import monotonic
-from typing import NewType
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
-import google.auth.external_account_authorized_user
-import google.oauth2.credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from config import _GoogleSettings
+from config import GoogleSettings
 
 TOKEN_FILE: Path = Path(__file__).resolve().parents[1] / "gmail-token.json"
 SCOPES: list[str] = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-ExternalCredentials = NewType(
-    "ExternalCredentials",
-    google.auth.external_account_authorized_user.Credentials,
-)
-Oauth2Credentials = NewType(
-    "Oauth2Credentials",
-    google.oauth2.credentials.Credentials,
-)
 
 
 class _Callback:
@@ -80,7 +68,7 @@ def authorize(flow: InstalledAppFlow, port: int = 8080, timeout: float = 300):
 
 
 def main() -> None:
-    settings = _GoogleSettings()
+    settings = GoogleSettings()
     flow: InstalledAppFlow = InstalledAppFlow.from_client_config(
         {
             "installed": {
@@ -93,7 +81,7 @@ def main() -> None:
         },
         SCOPES,
     )
-    credentials: ExternalCredentials | Oauth2Credentials = authorize(flow)
+    credentials = authorize(flow)
     if not credentials.refresh_token:
         raise RuntimeError("Google did not return a refresh token; no file was saved.")
 

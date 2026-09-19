@@ -1,43 +1,36 @@
-# bowling-email-subscriber
+# Bowling Email Subscriber
 
-FastAPI application for the bowling-validator project. It currently provides a
-`/hello` route and redirects `/` to `/docs`; Gmail labels are available through
-`/gmail-subscriber/labels` after mailbox authorization.
+The Bowling Email Subscriber is the FastAPI service that connects the
+bowling-validator project to one authorized Gmail mailbox.
 
-See the [repository README](../README.md) for environment variables, local and
-development-container setup, project structure, and development commands.
+It provides:
 
-## Authorize your mailbox
+- a health endpoint at `/hello`;
+- a protected Gmail labels endpoint at `/gmail-subscriber/labels`;
+- authenticated Gmail watch renewal at `/gmail-subscriber/watch`;
+- authenticated Pub/Sub delivery at `/gmail-subscriber/push`.
 
-Enable the Gmail API and configure the OAuth consent screen in Google Cloud.
-Set `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in your `.env`.
-Use a Desktop OAuth client for this local setup flow. If using a Web application
-client, register `http://localhost:8080/` as an authorized redirect URI.
+The service tracks Gmail history in PostgreSQL in production and SQLite during
+local development. It currently logs the body of new inbox messages whose
+subject is exactly `Test`; form automation is planned but not implemented.
 
-From this directory, run:
+See [Google Cloud setup](docs/google-cloud.md) for OAuth, Gmail, Pub/Sub,
+Neon, FastAPI Cloud, and Cloud Scheduler configuration.
 
-```bash
-uv run python -m scripts.oauth
-```
+## Development
 
-Open the printed URL in your browser and approve Gmail read access. The command
-explicitly requests offline access and consent, even if you previously approved
-the app. It saves `gmail-token.json` only when Google returns a refresh token.
-This file is ignored by Git and readable/writable only by its owner.
-
-The callback uses `http://localhost:8080/`. In a remote dev container or Codespace,
-forward port 8080 to localhost on the machine running your browser (for example,
-through VS Code desktop). A public HTTPS forwarded URL is not the same callback.
-Alternatively, run this setup locally and securely copy the generated token file
-into this application directory on the server.
-
-Verify authorization and fetch label names and IDs directly:
+From this directory:
 
 ```bash
-uv run python -m scripts.labels
+uv sync --locked
+uv run fastapi dev main.py
 ```
 
-Or start the API as usual and call `/gmail-subscriber/labels`. The Google client
-uses the saved refresh token to obtain access tokens automatically. Run the setup
-command again if access is revoked. This setup authorizes one mailbox for the
-service; it does not implement per-user web login.
+Run the quality checks with:
+
+```bash
+uv run python -m unittest gmail_subscriber.test_notifications
+uv run ruff check .
+uv run ruff format --check .
+uv run pyrefly check
+```
