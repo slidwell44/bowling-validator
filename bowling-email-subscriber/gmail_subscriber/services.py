@@ -6,6 +6,7 @@ import logging
 import secrets
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -20,6 +21,7 @@ from googleapiclient.errors import HttpError
 
 from config import GmailSettings
 from scripts.oauth import SCOPES, TOKEN_FILE
+from form_automation.services import accept_invite, is_acceptable_date, parse_dac_invite
 
 if TYPE_CHECKING:
     from googleapiclient._apis.gmail.v1 import GmailResource
@@ -124,6 +126,10 @@ def history_state(path=STATE_FILE):
         connection.execute(
             "CREATE TABLE IF NOT EXISTS mailbox "
             "(email TEXT PRIMARY KEY, history_id TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS accepted_invites "
+            "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL)"
         )
         if not database_url:
             connection.execute("BEGIN IMMEDIATE")
@@ -237,6 +243,46 @@ def process_notification(gmail, email: str, history_id: str, *, path=STATE_FILE)
                             f"\n--- Gmail message {message_id}: Test ---\n{body}\n",
                             flush=True,
                         )
+                    invite = parse_dac_invite(raw)
+                    if invite is not None:
+                        invite_url, event_date = invite
+                        already = _execute(
+                            state,
+                            "SELECT 1 FROM accepted_invites WHERE message_id = ?",
+                            (message_id,),
+                        ).fetchone()
+                        if not is_acceptable_date(event_date):
+                            logger.info(
+                                "Skipping DAC invite for past date %s (%s)",
+                                event_date,
+                                message_id,
+                            )
+                        elif already:
+                            logger.info(
+                                "DAC invite %s already accepted; skipping",
+                                message_id,
+                            )
+                        else:
+                            logger.info(
+                                "Auto-accepting DAC invite for %s (%s)",
+                                event_date,
+                                message_id,
+                            )
+                            if accept_invite(invite_url):
+                                _execute(
+                                    state,
+                                    "INSERT INTO accepted_invites "
+                                    "(message_id, accepted_at) VALUES (?, ?)",
+                                    (
+                                        message_id,
+                                        datetime.now(timezone.utc).isoformat(),
+                                    ),
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"DAC invite {message_id} accepted-click did "
+                                    "not confirm; leaving cursor so delivery retries"
+                                )
             page_token = page.get("nextPageToken")
             if not page_token:
                 _execute(

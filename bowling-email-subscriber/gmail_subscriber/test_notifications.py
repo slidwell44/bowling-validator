@@ -11,6 +11,9 @@ from unittest.mock import MagicMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from datetime import date
+
+from form_automation.services import is_acceptable_date, parse_dac_invite
 from gmail_subscriber.endpoints import router
 from gmail_subscriber.services import (
     history_state,
@@ -260,6 +263,56 @@ class PushTests(unittest.TestCase):
             verify.return_value["email"] = "other@example.com"
             with self.assertRaises(ValueError):
                 GmailSubscriberService.verify_identity("token")
+
+
+def dac_raw_email(
+    subject="Substitute bowler request for Kurt R. Vilders; 10/13/2026",
+    sender="DAC Mail <dacmail@dacrsc.com>",
+    body=(
+        "You are invited to sub.\n"
+        "Please click here to accept or decline: http://email.dacrsc.com/c/abc123\n"
+        '<img src="http://email.dacrsc.com/o/xyz789">'
+    ),
+):
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender
+    message.set_content(body)
+    return base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
+
+
+class DacInviteTests(unittest.TestCase):
+    def test_parse_invite_extracts_url_and_date(self):
+        result = parse_dac_invite(dac_raw_email())
+        self.assertIsNotNone(result)
+        url, event_date = result
+        self.assertEqual(url, "http://email.dacrsc.com/c/abc123")
+        self.assertEqual(event_date, date(2026, 10, 13))
+
+    def test_ignores_non_dac_sender(self):
+        self.assertIsNone(
+            parse_dac_invite(dac_raw_email(sender="Spammer <spam@example.com>"))
+        )
+
+    def test_ignores_update_subject(self):
+        self.assertIsNone(
+            parse_dac_invite(
+                dac_raw_email(subject="Substitute bowler update by Simon Lidwell")
+            )
+        )
+
+    def test_ignores_pixel_only_body(self):
+        self.assertIsNone(
+            parse_dac_invite(
+                dac_raw_email(
+                    body='<img src="http://email.dacrsc.com/o/xyz789">'
+                )
+            )
+        )
+
+    def test_acceptable_dates(self):
+        self.assertTrue(is_acceptable_date(date(2100, 1, 1)))
+        self.assertFalse(is_acceptable_date(date(2000, 1, 1)))
 
 
 if __name__ == "__main__":

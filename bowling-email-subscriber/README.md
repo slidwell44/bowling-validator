@@ -12,7 +12,23 @@ It provides:
 
 The service tracks Gmail history in PostgreSQL in production and SQLite during
 local development. It currently logs the body of new inbox messages whose
-subject is exactly `Test`; form automation is planned but not implemented.
+subject is exactly `Test`.
+
+When a DAC substitute-bowler request arrives (`Substitute bowler request for ...`
+from DAC Mail), the service extracts the accept URL from the message and completes
+the acceptance automatically: headless Chromium (Playwright) opens the invite page,
+clicks the Accept button, and verifies the confirmation. Invites for past dates are
+skipped, and each accepted Gmail message ID is recorded so a Pub/Sub redelivery
+never double-accepts. A failed accept leaves the history cursor in place so the
+next delivery retries.
+
+Form automation needs Playwright's Chromium on the host (including in production):
+
+```bash
+uv run playwright install chromium
+```
+
+plus the usual OS dependencies (`playwright install --with-deps` on a blank VM).
 
 See [Google Cloud setup](docs/google-cloud.md) for OAuth, Gmail, Pub/Sub,
 Neon, FastAPI Cloud, and Cloud Scheduler configuration.
