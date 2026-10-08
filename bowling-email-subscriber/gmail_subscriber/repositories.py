@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +11,7 @@ import psycopg
 from config import GmailSettings
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "gmail-history.sqlite3"
+logger = logging.getLogger(__name__)
 
 
 class MailboxRepository:
@@ -41,16 +43,18 @@ class MailboxRepository:
             else sqlite3.connect(path, timeout=30)
         )
         try:
-            if database_url:
-                connection.execute("SELECT pg_advisory_xact_lock(724938201)")
             repository = cls(connection)
             repository.create_tables()
-            if not database_url:
-                connection.execute("BEGIN IMMEDIATE")
+            connection.commit()
             yield repository
             connection.commit()
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception:
+                logger.exception(
+                    "Database rollback failed; preserving the original exception"
+                )
             raise
         finally:
             connection.close()
@@ -72,8 +76,10 @@ class MailboxRepository:
 
     def update_history(self, email: str, history_id: str) -> None:
         self._execute(
-            "UPDATE mailbox SET history_id = ? WHERE email = ?",
-            (history_id, email),
+            "UPDATE mailbox SET history_id = CASE "
+            "WHEN CAST(history_id AS NUMERIC) < CAST(? AS NUMERIC) THEN ? "
+            "ELSE history_id END WHERE email = ?",
+            (history_id, history_id, email),
         )
 
     def record_processed_message(
@@ -96,4 +102,15 @@ class MailboxRepository:
         if isinstance(self.connection, psycopg.Connection):
             query = query.replace("?", "%s")
         connection: Any = self.connection
-        return connection.execute(query, parameters)
+        try:
+            cursor = connection.execute(query, parameters)
+            connection.commit()
+            return cursor
+        except Exception:
+            try:
+                connection.rollback()
+            except Exception:
+                logger.exception(
+                    "Database rollback failed; preserving the original exception"
+                )
+            raise

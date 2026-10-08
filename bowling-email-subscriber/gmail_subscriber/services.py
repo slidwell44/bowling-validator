@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
+from threading import RLock
 from typing import TYPE_CHECKING
 
 from google.auth.transport.requests import Request
@@ -82,10 +83,14 @@ class GmailSubscriberService:
         )
 
     def start_watch(self):
-        return start_watch(self.gmail, GmailSettings().PUBSUB_TOPIC, self.repository)
+        with _gmail_api_lock:
+            return start_watch(
+                self.gmail, GmailSettings().PUBSUB_TOPIC, self.repository
+            )
 
     def process_notification(self, email: str, history_id: str):
-        return process_notification(self.gmail, email, history_id, self.repository)
+        with _gmail_api_lock:
+            return process_notification(self.gmail, email, history_id, self.repository)
 
     @property
     def gmail(self) -> GmailResource:
@@ -96,16 +101,22 @@ class GmailSubscriberService:
         return self.load_credentials()
 
     def fetch_gmail_labels(self) -> list[Label]:
-        results: ListLabelsResponse = (
-            self._gmail_service.users().labels().list(userId="me").execute()
-        )
+        with _gmail_api_lock:
+            results: ListLabelsResponse = (
+                self._gmail_service.users()
+                .labels()
+                .list(userId="me")
+                .execute(num_retries=GMAIL_HTTP_RETRIES)
+            )
         labels: list[Label] = results.get("labels", [])
         return labels
 
 
 SUBJECT_MARKER = "Substitute bowler request"
 TEST_SUBJECT = "Test"
+GMAIL_HTTP_RETRIES = 3
 logger = logging.getLogger(__name__)
+_gmail_api_lock = RLock()
 
 
 def is_relevant_subject(subject: str) -> bool:
@@ -129,6 +140,51 @@ def decoded_subject(value: str) -> str:
     return str(make_header(decode_header(value)))
 
 
+def message_subject_and_body(message: dict) -> tuple[str, str]:
+    payload = message.get("payload", {})
+    subject = decoded_subject(
+        next(
+            (
+                header["value"]
+                for header in payload.get("headers", [])
+                if header.get("name", "").lower() == "subject"
+            ),
+            "",
+        )
+    )
+    text_parts: list[tuple[str, bytes, str]] = []
+
+    def collect_parts(part: dict) -> None:
+        mime_type = part.get("mimeType", "")
+        data = part.get("body", {}).get("data")
+        if mime_type in {"text/plain", "text/html"} and data:
+            part_headers = {
+                header.get("name", "").lower(): header.get("value", "")
+                for header in part.get("headers", [])
+            }
+            charset = "utf-8"
+            content_type = part_headers.get("content-type", "")
+            for parameter in content_type.split(";")[1:]:
+                name, separator, value = parameter.strip().partition("=")
+                if separator and name.lower() == "charset":
+                    charset = value.strip('"')
+                    break
+            decoded = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+            text_parts.append((mime_type, decoded, charset))
+        for child in part.get("parts", []):
+            collect_parts(child)
+
+    collect_parts(payload)
+    for preferred_type in ("text/plain", "text/html"):
+        for mime_type, data, charset in text_parts:
+            if mime_type == preferred_type:
+                try:
+                    return subject, data.decode(charset)
+                except LookupError, UnicodeDecodeError:
+                    return subject, data.decode("utf-8", errors="replace")
+    return subject, ""
+
+
 @contextmanager
 def history_state(path=STATE_FILE):
     with MailboxRepository.from_settings(path) as repository:
@@ -136,7 +192,12 @@ def history_state(path=STATE_FILE):
 
 
 def start_watch(
-    gmail, topic: str, repository=None, *, reset_history=False, path=STATE_FILE
+    gmail,
+    topic: str,
+    repository=None,
+    *,
+    reset_history=False,
+    path=STATE_FILE,
 ):
     if repository is None:
         with MailboxRepository.from_settings(path) as repository_context:
@@ -144,7 +205,11 @@ def start_watch(
                 gmail, topic, repository_context, reset_history=reset_history
             )
     else:
-        email = gmail.users().getProfile(userId="me").execute()["emailAddress"]
+        email = (
+            gmail.users()
+            .getProfile(userId="me")
+            .execute(num_retries=GMAIL_HTTP_RETRIES)["emailAddress"]
+        )
         result = (
             gmail.users()
             .watch(
@@ -155,7 +220,7 @@ def start_watch(
                     "labelFilterBehavior": "include",
                 },
             )
-            .execute()
+            .execute(num_retries=GMAIL_HTTP_RETRIES)
         )
         if reset_history:
             repository.reset_history(email)
@@ -164,7 +229,12 @@ def start_watch(
 
 
 def process_notification(
-    gmail, email: str, history_id: str, repository=None, *, path=STATE_FILE
+    gmail,
+    email: str,
+    history_id: str,
+    repository=None,
+    *,
+    path=STATE_FILE,
 ):
     # Serialize deliveries and persist progress only after every page succeeds.
     if repository is None:
@@ -203,7 +273,7 @@ def process_notification(
                         historyTypes=["messageAdded"],
                         pageToken=page_token,
                     )
-                    .execute()
+                    .execute(num_retries=GMAIL_HTTP_RETRIES)
                 )
             except HttpError as exc:
                 if exc.resp.status == 404:
@@ -220,48 +290,20 @@ def process_notification(
                         continue
                     seen.add(message_id)
                     try:
-                        metadata = (
+                        message = (
                             gmail.users()
                             .messages()
-                            .get(
-                                userId="me",
-                                id=message_id,
-                                format="metadata",
-                                metadataHeaders=["Subject"],
-                            )
-                            .execute()
+                            .get(userId="me", id=message_id, format="full")
+                            .execute(num_retries=GMAIL_HTTP_RETRIES)
                         )
                     except HttpError as exc:
                         if exc.resp.status == 404:
                             continue  # The message was deleted before delivery.
                         raise
-                    subject = decoded_subject(
-                        next(
-                            (
-                                header["value"]
-                                for header in metadata.get("payload", {}).get(
-                                    "headers", []
-                                )
-                                if header.get("name", "").lower() == "subject"
-                            ),
-                            "",
-                        )
-                    )
+                    subject, body = message_subject_and_body(message)
                     if not is_relevant_subject(subject):
                         continue
-                    try:
-                        raw = (
-                            gmail.users()
-                            .messages()
-                            .get(userId="me", id=message_id, format="raw")
-                            .execute()["raw"]
-                        )
-                    except HttpError as exc:
-                        if exc.resp.status == 404:
-                            continue  # The message was deleted before delivery.
-                        raise
-                    body = matching_body(raw)
-                    if body is not None and repository.record_processed_message(
+                    if repository.record_processed_message(
                         message_id, email, subject, body, history_id
                     ):
                         print(

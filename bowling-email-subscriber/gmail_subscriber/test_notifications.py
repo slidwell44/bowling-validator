@@ -6,16 +6,20 @@ import unittest
 from contextlib import redirect_stdout
 from email.message import EmailMessage
 from pathlib import Path
+from threading import Event, Lock, Thread
 from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from psycopg import OperationalError
 
 from gmail_subscriber.endpoints import router
 from gmail_subscriber.services import (
+    GmailSubscriberService,
     history_state,
     is_relevant_subject,
     matching_body,
+    message_subject_and_body,
     process_notification,
     start_watch,
 )
@@ -33,6 +37,37 @@ def raw_email(subject="Substitute bowler request"):
         filename="test.txt",
     )
     return base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
+
+
+def api_message(subject="Substitute bowler request", body="Plain body"):
+    encoded_body = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
+    return {
+        "payload": {
+            "headers": [{"name": "Subject", "value": subject}],
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "text/html",
+                    "body": {
+                        "data": base64.urlsafe_b64encode(b"<p>HTML body</p>").decode()
+                    },
+                },
+                {
+                    "mimeType": "application/pdf",
+                    "body": {"attachmentId": "attachment-not-fetched"},
+                },
+                {
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {
+                            "mimeType": "text/plain",
+                            "body": {"data": encoded_body},
+                        }
+                    ],
+                },
+            ],
+        }
+    }
 
 
 class NotificationTests(unittest.TestCase):
@@ -56,6 +91,11 @@ class NotificationTests(unittest.TestCase):
         ).decode()
         self.assertEqual(matching_body(raw), "<p>Hello</p>")
 
+    def test_full_message_extracts_text_without_fetching_attachments(self):
+        subject, body = message_subject_and_body(api_message(body="Request body"))
+        self.assertEqual(subject, "Substitute bowler request")
+        self.assertEqual(body, "Request body")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -71,22 +111,21 @@ class NotificationTests(unittest.TestCase):
             {"history": [{"messagesAdded": [added, sent]}], "nextPageToken": "next"},
             {"history": [{"messagesAdded": [added]}], "historyId": "20"},
         ]
-        self.gmail.users().messages().get().execute.side_effect = [
-            {
-                "payload": {
-                    "headers": [
-                        {"name": "Subject", "value": "Substitute bowler request"}
-                    ]
-                }
-            },
-            {"raw": raw_email()},
-        ]
+        self.gmail.users().messages().get().execute.return_value = api_message(
+            body="Plain body with unicode: café\n"
+        )
+        message_get = self.gmail.users().messages().get
+        message_get.reset_mock()
         output = io.StringIO()
         with redirect_stdout(output):
             process_notification(self.gmail, "user@example.com", "15", path=self.path)
             process_notification(self.gmail, "user@example.com", "15", path=self.path)
         self.assertEqual(output.getvalue().count("--- Gmail message"), 1)
         self.assertEqual(self.gmail.users().history().list().execute.call_count, 2)
+        for call in self.gmail.users().history().list().execute.call_args_list:
+            self.assertEqual(call.kwargs["num_retries"], 3)
+        self.assertEqual(message_get.call_count, 1)
+        self.assertEqual(message_get.call_args.kwargs["format"], "full")
         with history_state(self.path) as state:
             row = state.execute("SELECT history_id FROM mailbox").fetchone()
             self.assertIsNotNone(row)
@@ -149,6 +188,58 @@ class NotificationTests(unittest.TestCase):
 
 
 class PushTests(unittest.TestCase):
+    def test_gmail_service_calls_are_serialized(self):
+        service = GmailSubscriberService(
+            repository=MagicMock(), gmail_service=MagicMock()
+        )
+        first_entered = Event()
+        second_attempting = Event()
+        second_entered = Event()
+        release_first = Event()
+        state_lock = Lock()
+        active_calls = 0
+        maximum_active_calls = 0
+
+        def fake_process_notification(_gmail, email, _history_id, _repository):
+            nonlocal active_calls, maximum_active_calls
+            with state_lock:
+                active_calls += 1
+                maximum_active_calls = max(maximum_active_calls, active_calls)
+            if email == "first@example.com":
+                first_entered.set()
+                release_first.wait(timeout=2)
+            else:
+                second_entered.set()
+            with state_lock:
+                active_calls -= 1
+
+        def run_first():
+            service.process_notification("first@example.com", "11")
+
+        def run_second():
+            second_attempting.set()
+            service.process_notification("second@example.com", "12")
+
+        with patch(
+            "gmail_subscriber.services.process_notification",
+            side_effect=fake_process_notification,
+        ):
+            first = Thread(target=run_first)
+            second = Thread(target=run_second)
+            first.start()
+            self.assertTrue(first_entered.wait(timeout=2))
+            second.start()
+            self.assertTrue(second_attempting.wait(timeout=2))
+            self.assertFalse(second_entered.wait(timeout=0.1))
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(maximum_active_calls, 1)
+
     def test_service_provider_reuses_service(self):
         from gmail_subscriber.dependencies import get_gmail_service
 
@@ -167,7 +258,7 @@ class PushTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DATABASE_URL"), history_state():
                 self.fail("Must not fall back to ephemeral SQLite")
 
-    def test_postgres_lock_and_rollback(self):
+    def test_postgres_transactions_are_short_lived(self):
         with (
             patch("gmail_subscriber.repositories.GmailSettings") as settings,
             patch("gmail_subscriber.repositories.psycopg.connect") as connect,
@@ -181,11 +272,51 @@ class PushTests(unittest.TestCase):
                 history_state(),
             ):
                 raise RuntimeError("processing failed")
-            connection.execute.assert_any_call(
-                "SELECT pg_advisory_xact_lock(724938201)"
+            self.assertFalse(
+                any(
+                    "advisory_lock" in str(call)
+                    for call in connection.execute.call_args_list
+                )
             )
             connection.rollback.assert_called_once()
-            connection.commit.assert_not_called()
+            connection.commit.assert_called_once()
+            connection.close.assert_called_once()
+
+    def test_history_cursor_never_moves_backwards(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            with history_state(path) as connection:
+                connection.execute(
+                    "INSERT INTO mailbox VALUES ('user@example.com', '10')"
+                )
+            with history_state(path) as connection:
+                repository = MailboxRepository(connection)
+                repository.update_history("user@example.com", "9")
+                self.assertEqual(repository.get_history_id("user@example.com"), "10")
+
+    def test_rollback_failure_preserves_original_exception(self):
+        with (
+            patch("gmail_subscriber.repositories.GmailSettings") as settings,
+            patch("gmail_subscriber.repositories.psycopg.connect") as connect,
+        ):
+            settings.return_value.DATABASE_URL.get_secret_value.return_value = (
+                "postgresql://test"
+            )
+            connection = connect.return_value
+            connection.rollback.side_effect = OperationalError("the connection is lost")
+            with (
+                self.assertLogs("gmail_subscriber.repositories", level="ERROR") as logs,
+                self.assertRaisesRegex(RuntimeError, "processing failed"),
+                history_state(),
+            ):
+                raise RuntimeError("processing failed")
+
+            self.assertIn(
+                "Database rollback failed; preserving the original exception",
+                logs.output[0],
+            )
             connection.close.assert_called_once()
 
     def test_authentication_payload_and_retry(self):
