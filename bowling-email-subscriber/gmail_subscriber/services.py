@@ -5,6 +5,7 @@ import json
 import logging
 import secrets
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
@@ -20,6 +21,7 @@ from googleapiclient.errors import HttpError
 from config import GmailSettings
 from gmail_subscriber.repositories import STATE_FILE, MailboxRepository
 from scripts.oauth import SCOPES, TOKEN_FILE
+from form_automation.services import accept_invite, is_acceptable_date, parse_dac_invite
 
 if TYPE_CHECKING:
     from googleapiclient._apis.gmail.v1 import GmailResource
@@ -210,6 +212,30 @@ def start_watch(
             .getProfile(userId="me")
             .execute(num_retries=GMAIL_HTTP_RETRIES)["emailAddress"]
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS accepted_invites "
+            "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL)"
+        )
+        if not database_url:
+            connection.execute("BEGIN IMMEDIATE")
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _execute(connection, query, parameters):
+    if isinstance(connection, psycopg.Connection):
+        query = query.replace("?", "%s")
+    return connection.execute(query, parameters)
+
+
+def start_watch(gmail, topic: str, *, reset_history=False, path=STATE_FILE):
+    with history_state(path) as state:
+        email = gmail.users().getProfile(userId="me").execute()["emailAddress"]
         result = (
             gmail.users()
             .watch(
@@ -310,6 +336,46 @@ def process_notification(
                             f"\n--- Gmail message {message_id}: {subject} ---\n{body}\n",
                             flush=True,
                         )
+                    invite = parse_dac_invite(raw)
+                    if invite is not None:
+                        invite_url, event_date = invite
+                        already = _execute(
+                            state,
+                            "SELECT 1 FROM accepted_invites WHERE message_id = ?",
+                            (message_id,),
+                        ).fetchone()
+                        if not is_acceptable_date(event_date):
+                            logger.info(
+                                "Skipping DAC invite for past date %s (%s)",
+                                event_date,
+                                message_id,
+                            )
+                        elif already:
+                            logger.info(
+                                "DAC invite %s already accepted; skipping",
+                                message_id,
+                            )
+                        else:
+                            logger.info(
+                                "Auto-accepting DAC invite for %s (%s)",
+                                event_date,
+                                message_id,
+                            )
+                            if accept_invite(invite_url):
+                                _execute(
+                                    state,
+                                    "INSERT INTO accepted_invites "
+                                    "(message_id, accepted_at) VALUES (?, ?)",
+                                    (
+                                        message_id,
+                                        datetime.now(timezone.utc).isoformat(),
+                                    ),
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"DAC invite {message_id} accepted-click did "
+                                    "not confirm; leaving cursor so delivery retries"
+                                )
             page_token = page.get("nextPageToken")
             if not page_token:
                 repository.update_history(email, page["historyId"])
