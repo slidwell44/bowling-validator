@@ -7,7 +7,7 @@ from google.auth.exceptions import GoogleAuthError
 from pydantic import BaseModel, Field, field_validator
 
 from gmail_subscriber.dependencies import provide_gmail_subscriber_service
-from gmail_subscriber.services import GmailSubscriberService
+from gmail_subscriber.services import GmailQuotaExceeded, GmailSubscriberService
 
 router = APIRouter(prefix="/gmail-subscriber")
 logger = logging.getLogger(__name__)
@@ -90,7 +90,15 @@ def receive_push(
         notification.emailAddress,
         notification.historyId,
     )
-    service.process_notification(notification.emailAddress, notification.historyId)
+    try:
+        service.process_notification(notification.emailAddress, notification.historyId)
+    except GmailQuotaExceeded as exc:
+        logger.warning("Gmail quota reached; asking Pub/Sub to retry with backoff")
+        raise HTTPException(
+            503,
+            "Gmail quota temporarily exceeded; retry later",
+            headers={"Retry-After": "60"},
+        ) from exc
     logger.info("Processed Gmail push notification for %s", notification.emailAddress)
     return Response(status_code=204)
 

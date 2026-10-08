@@ -129,6 +129,9 @@ Register the watch on the deployed endpoint so its cursor is stored in Neon.
 The application creates these tables automatically in the configured database:
 
 - `mailbox` stores the Gmail history cursor for the watched mailbox.
+- `inspected_messages` remembers Gmail messages already fetched while processing
+  history. This prevents Pub/Sub retries from rereading the same unrelated or
+  already-processed inbox messages.
 - `processed_messages` stores each successfully processed substitute-bowler
   request, including its Gmail message ID, mailbox, subject, body, history ID,
   and processing timestamp. The message ID is unique, so Pub/Sub retries do
@@ -150,9 +153,10 @@ case-insensitively. It prefers plain text and falls back to HTML source.
 Pub/Sub notifications contain mailbox history, not the email subject, so
 Pub/Sub filters cannot filter by subject or body.
 
-HTTP 204 acknowledges a notification. Non-success responses cause Pub/Sub to
-retry. PostgreSQL preserves the cursor across deployments and serializes
-concurrent deliveries.
+HTTP 204 acknowledges a notification. Gmail quota exhaustion returns HTTP 503
+with `Retry-After: 60`, allowing Pub/Sub to back off and retry. Successfully
+inspected messages are skipped during those retries, and PostgreSQL cursor
+updates cannot move backward. PostgreSQL preserves the cursor across deployments.
 
 If Gmail history expires, reset the cursor intentionally with matching cloud
 credentials:

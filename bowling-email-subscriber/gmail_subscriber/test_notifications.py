@@ -18,6 +18,7 @@ from datetime import date
 from form_automation.services import is_acceptable_date, parse_dac_invite
 from gmail_subscriber.endpoints import router
 from gmail_subscriber.services import (
+    GmailQuotaExceeded,
     GmailSubscriberService,
     history_state,
     is_relevant_subject,
@@ -150,6 +151,27 @@ class NotificationTests(unittest.TestCase):
                     "15",
                 ),
             )
+            inspected = state.execute(
+                "SELECT mailbox_email, message_id FROM inspected_messages"
+            ).fetchone()
+            self.assertEqual(inspected, ("user@example.com", "one"))
+
+    def test_retry_skips_messages_already_inspected(self):
+        with history_state(self.path) as state:
+            state.execute(
+                "INSERT INTO inspected_messages (mailbox_email, message_id) "
+                "VALUES ('user@example.com', 'one')"
+            )
+        self.gmail.users().history().list().execute.return_value = {
+            "history": [
+                {"messagesAdded": [{"message": {"id": "one", "labelIds": ["INBOX"]}}]}
+            ],
+            "historyId": "20",
+        }
+
+        process_notification(self.gmail, "user@example.com", "15", path=self.path)
+
+        self.gmail.users().messages().get.assert_not_called()
 
     def test_failure_does_not_advance_cursor(self):
         self.gmail.users().history().list().execute.side_effect = RuntimeError(
@@ -261,7 +283,7 @@ class PushTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DATABASE_URL"), history_state():
                 self.fail("Must not fall back to ephemeral SQLite")
 
-    def test_postgres_transactions_are_short_lived(self):
+    def test_postgres_schema_creation_is_serialized_in_short_transaction(self):
         with (
             patch("gmail_subscriber.repositories.GmailSettings") as settings,
             patch("gmail_subscriber.repositories.psycopg.connect") as connect,
@@ -275,11 +297,8 @@ class PushTests(unittest.TestCase):
                 history_state(),
             ):
                 raise RuntimeError("processing failed")
-            self.assertFalse(
-                any(
-                    "advisory_lock" in str(call)
-                    for call in connection.execute.call_args_list
-                )
+            connection.execute.assert_any_call(
+                "SELECT pg_advisory_xact_lock(%s)", (724938202,)
             )
             connection.rollback.assert_called_once()
             connection.commit.assert_called_once()
@@ -361,6 +380,13 @@ class PushTests(unittest.TestCase):
             service.process_notification.assert_called_once_with(
                 "user@example.com", "15"
             )
+            service.process_notification.side_effect = GmailQuotaExceeded("quota")
+            quota_response = client.post(
+                "/gmail-subscriber/push", json=envelope, headers=headers
+            )
+            self.assertEqual(quota_response.status_code, 503)
+            self.assertEqual(quota_response.headers["retry-after"], "60")
+            service.process_notification.side_effect = None
             service.process_notification.reset_mock()
             urlsafe_data = (
                 base64.urlsafe_b64encode(

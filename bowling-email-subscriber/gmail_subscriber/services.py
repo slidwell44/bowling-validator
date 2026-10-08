@@ -114,6 +114,10 @@ class GmailSubscriberService:
         return labels
 
 
+class GmailQuotaExceeded(Exception):
+    """Raised when Gmail rejects a request for exceeding its query quota."""
+
+
 SUBJECT_MARKER = "Substitute bowler request"
 TEST_SUBJECT = "Test"
 GMAIL_HTTP_RETRIES = 3
@@ -140,6 +144,23 @@ def matching_body(raw: str) -> str | None:
 
 def decoded_subject(value: str) -> str:
     return str(make_header(decode_header(value)))
+
+
+def is_gmail_quota_error(error: HttpError) -> bool:
+    if error.resp.status != 403:
+        return False
+    try:
+        payload = json.loads(error.content.decode("utf-8"))
+    except AttributeError, UnicodeDecodeError, json.JSONDecodeError:
+        return "quota exceeded" in str(error).casefold()
+    details = payload.get("error", {})
+    reasons = {item.get("reason", "") for item in details.get("errors", [])}
+    return bool(
+        reasons.intersection(
+            {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}
+        )
+        or "quota exceeded" in details.get("message", "").casefold()
+    )
 
 
 def message_subject_and_body(message: dict) -> tuple[str, str]:
@@ -307,6 +328,10 @@ def process_notification(
                         "Gmail history expired. Run python -m scripts.watch --reset-history "
                         "to resume from now; intervening messages will not be replayed."
                     )
+                if is_gmail_quota_error(exc):
+                    raise GmailQuotaExceeded(
+                        "Gmail query quota exceeded while listing mailbox history"
+                    ) from exc
                 raise
             for event in page.get("history", []):
                 for added in event.get("messagesAdded", []):
@@ -315,6 +340,8 @@ def process_notification(
                     if message_id in seen or "INBOX" not in message.get("labelIds", []):
                         continue
                     seen.add(message_id)
+                    if repository.was_message_inspected(email, message_id):
+                        continue
                     try:
                         message = (
                             gmail.users()
@@ -325,13 +352,20 @@ def process_notification(
                     except HttpError as exc:
                         if exc.resp.status == 404:
                             continue  # The message was deleted before delivery.
+                        if is_gmail_quota_error(exc):
+                            raise GmailQuotaExceeded(
+                                "Gmail query quota exceeded while reading a message"
+                            ) from exc
                         raise
                     subject, body = message_subject_and_body(message)
                     if not is_relevant_subject(subject):
+                        repository.mark_message_inspected(email, message_id)
                         continue
-                    if repository.record_processed_message(
+                    inserted = repository.record_processed_message(
                         message_id, email, subject, body, history_id
-                    ):
+                    )
+                    repository.mark_message_inspected(email, message_id)
+                    if inserted:
                         print(
                             f"\n--- Gmail message {message_id}: {subject} ---\n{body}\n",
                             flush=True,

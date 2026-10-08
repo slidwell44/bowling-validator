@@ -11,6 +11,7 @@ import psycopg
 from config import GmailSettings
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "gmail-history.sqlite3"
+SCHEMA_LOCK_ID = 724938202
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +30,12 @@ class MailboxRepository:
             "subject TEXT NOT NULL, body TEXT NOT NULL, history_id TEXT NOT NULL, "
             "processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS inspected_messages "
+            "(mailbox_email TEXT NOT NULL, message_id TEXT NOT NULL, "
+            "inspected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "PRIMARY KEY (mailbox_email, message_id))"
+        )
 
     @classmethod
     @contextmanager
@@ -44,6 +51,10 @@ class MailboxRepository:
         )
         try:
             repository = cls(connection)
+            if database_url:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_ID,)
+                )
             repository.create_tables()
             connection.commit()
             yield repository
@@ -97,6 +108,23 @@ class MailboxRepository:
             (message_id, mailbox_email, subject, body, history_id),
         )
         return bool(result.rowcount)
+
+    def was_message_inspected(self, mailbox_email: str, message_id: str) -> bool:
+        return (
+            self._execute(
+                "SELECT 1 FROM inspected_messages "
+                "WHERE mailbox_email = ? AND message_id = ?",
+                (mailbox_email, message_id),
+            ).fetchone()
+            is not None
+        )
+
+    def mark_message_inspected(self, mailbox_email: str, message_id: str) -> None:
+        self._execute(
+            "INSERT INTO inspected_messages (mailbox_email, message_id) "
+            "VALUES (?, ?) ON CONFLICT (mailbox_email, message_id) DO NOTHING",
+            (mailbox_email, message_id),
+        )
 
     def _execute(self, query: str, parameters: tuple[Any, ...]):
         if isinstance(self.connection, psycopg.Connection):
