@@ -39,7 +39,22 @@ class MailboxRepository:
         )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS accepted_invites "
-            "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL)"
+            "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL, "
+            "event_date TEXT, status TEXT NOT NULL DEFAULT 'accepted')"
+        )
+        accepted_columns = self._table_columns("accepted_invites")
+        if "event_date" not in accepted_columns:
+            self.connection.execute(
+                "ALTER TABLE accepted_invites ADD COLUMN event_date TEXT"
+            )
+        if "status" not in accepted_columns:
+            self.connection.execute(
+                "ALTER TABLE accepted_invites "
+                "ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'"
+            )
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS accepted_invites_event_date_idx "
+            "ON accepted_invites (event_date)"
         )
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS mailbox_processing_leases "
@@ -136,20 +151,52 @@ class MailboxRepository:
             (mailbox_email, message_id),
         )
 
-    def was_invite_accepted(self, message_id: str) -> bool:
+    def was_invite_accepted(self, event_date: str) -> bool:
         return (
             self._execute(
-                "SELECT 1 FROM accepted_invites WHERE message_id = ?", (message_id,)
+                "SELECT 1 FROM accepted_invites WHERE event_date = ?",
+                (event_date,),
             ).fetchone()
             is not None
         )
 
-    def record_accepted_invite(self, message_id: str, accepted_at: str) -> None:
-        self._execute(
-            "INSERT INTO accepted_invites (message_id, accepted_at) "
-            "VALUES (?, ?) ON CONFLICT (message_id) DO NOTHING",
-            (message_id, accepted_at),
+    def reserve_invite_date(self, event_date: str, message_id: str) -> bool:
+        result = self._execute(
+            "INSERT INTO accepted_invites "
+            "(message_id, accepted_at, event_date, status) "
+            "VALUES (?, ?, ?, 'pending') ON CONFLICT DO NOTHING",
+            (
+                message_id,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                event_date,
+            ),
         )
+        return bool(result.rowcount)
+
+    def record_accepted_invite(self, event_date: str, message_id: str) -> None:
+        self._execute(
+            "UPDATE accepted_invites SET status = 'accepted', accepted_at = ? "
+            "WHERE event_date = ? AND message_id = ?",
+            (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                event_date,
+                message_id,
+            ),
+        )
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        if isinstance(self.connection, psycopg.Connection):
+            rows = self.connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s",
+                (table_name,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                f"PRAGMA table_info({table_name})"
+            ).fetchall()
+        column_index = 0 if isinstance(self.connection, psycopg.Connection) else 1
+        return {row[column_index] for row in rows}
 
     def acquire_processing_lease(
         self, mailbox_email: str, lease_token: str, *, lease_seconds: int = 180

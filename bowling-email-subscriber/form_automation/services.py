@@ -33,6 +33,7 @@ from datetime import date, datetime
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
+from typing import Literal
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -98,7 +99,22 @@ def is_acceptable_date(event_date: date) -> bool:
 
 
 def accept_invite(invite_url: str, *, timeout_ms: int = 30000) -> bool:
-    """Open the invite URL headlessly, click Accept, verify confirmation.
+    """Open the invite URL headlessly, click Accept, verify confirmation."""
+    return respond_to_invite(invite_url, "accept", timeout_ms=timeout_ms)
+
+
+def decline_invite(invite_url: str, *, timeout_ms: int = 30000) -> bool:
+    """Open the invite URL headlessly, click Decline, verify confirmation."""
+    return respond_to_invite(invite_url, "decline", timeout_ms=timeout_ms)
+
+
+def respond_to_invite(
+    invite_url: str,
+    action: Literal["accept", "decline"],
+    *,
+    timeout_ms: int = 30000,
+) -> bool:
+    """Follow a DAC invitation and submit the selected response.
 
     Returns ``True`` when the resulting page looks like a confirmation.
     Raises on navigation or click failures so the caller can retry later.
@@ -116,29 +132,35 @@ def accept_invite(invite_url: str, *, timeout_ms: int = 30000) -> bool:
             page.goto(invite_url, wait_until="domcontentloaded", timeout=timeout_ms)
             # The tracking link redirects; let the landing page settle.
             page.wait_for_load_state("networkidle", timeout=timeout_ms)
-            button = _find_accept_button(page)
+            button = _find_response_button(page, action)
             if button is None:
-                logger.error("No Accept button found on the invite page")
+                logger.error("No %s button found on the invite page", action.title())
                 return False
             button.click(timeout=timeout_ms)
             page.wait_for_load_state("networkidle", timeout=timeout_ms)
             text = page.locator("body").inner_text(timeout=timeout_ms)
-            if re.search(r"\b(accept|confirm|thank|success)\b", text, re.IGNORECASE):
-                logger.info("DAC invite accepted (confirmation detected)")
+            response_word = "accepted" if action == "accept" else "declined"
+            if re.search(
+                rf"\b({response_word}|confirm|thank|success)\b", text, re.IGNORECASE
+            ):
+                logger.info("DAC invite %s (confirmation detected)", action)
                 return True
-            logger.warning("Accept clicked but no confirmation text detected")
+            logger.warning(
+                "%s clicked but no confirmation text detected", action.title()
+            )
             return False
         finally:
             browser.close()
 
 
-def _find_accept_button(page):  # type: ignore[no-untyped-def]
-    """Return a locator for the Accept button, never the Decline one."""
+def _find_response_button(page, action: Literal["accept", "decline"]):
+    """Return only the requested action's button or link."""
+    name = re.compile(rf"^{re.escape(action)}$", re.IGNORECASE)
     attempts = [
-        lambda: page.get_by_role("button", name=re.compile(r"^accept$", re.IGNORECASE)),
-        lambda: page.get_by_role("link", name=re.compile(r"^accept$", re.IGNORECASE)),
-        lambda: page.locator('input[type="submit"][value="Accept"]'),
-        lambda: page.locator('input[type="button"][value="Accept"]'),
+        lambda: page.get_by_role("button", name=name),
+        lambda: page.get_by_role("link", name=name),
+        lambda: page.locator(f'input[type="submit"][value="{action.title()}"]'),
+        lambda: page.locator(f'input[type="button"][value="{action.title()}"]'),
     ]
     for attempt in attempts:
         try:

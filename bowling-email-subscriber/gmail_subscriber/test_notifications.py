@@ -43,11 +43,18 @@ def raw_email(subject="Substitute bowler request"):
     return base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
 
 
-def api_message(subject="Substitute bowler request", body="Plain body"):
+def api_message(
+    subject="Substitute bowler request",
+    body="Plain body",
+    sender="DAC Mail <dacmail@dacrsc.com>",
+):
     encoded_body = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
     return {
         "payload": {
-            "headers": [{"name": "Subject", "value": subject}],
+            "headers": [
+                {"name": "Subject", "value": subject},
+                {"name": "From", "value": sender},
+            ],
             "mimeType": "multipart/mixed",
             "parts": [
                 {
@@ -99,6 +106,40 @@ class NotificationTests(unittest.TestCase):
         subject, body = message_subject_and_body(api_message(body="Request body"))
         self.assertEqual(subject, "Substitute bowler request")
         self.assertEqual(body, "Request body")
+
+    def test_auto_accepts_only_one_invite_for_each_event_date(self):
+        first = {"message": {"id": "first", "labelIds": ["INBOX"]}}
+        second = {"message": {"id": "second", "labelIds": ["INBOX"]}}
+        self.gmail.users().history().list().execute.side_effect = [
+            {"history": [{"messagesAdded": [first]}], "historyId": "20"},
+            {"history": [{"messagesAdded": [second]}], "historyId": "21"},
+        ]
+        self.gmail.users().messages().get().execute.side_effect = [
+            api_message(
+                subject="Substitute bowler request for Player One; 10/13/2026",
+                body="Please accept: http://email.dacrsc.com/c/invite-one",
+            ),
+            api_message(
+                subject="Substitute bowler request for Player Two; 10/13/2026",
+                body="Please accept: http://email.dacrsc.com/c/invite-two",
+            ),
+        ]
+        with (
+            patch(
+                "gmail_subscriber.services.accept_invite", return_value=True
+            ) as accept,
+            patch("gmail_subscriber.services.is_acceptable_date", return_value=True),
+            redirect_stdout(io.StringIO()),
+        ):
+            process_notification(self.gmail, "user@example.com", "15", path=self.path)
+            process_notification(self.gmail, "user@example.com", "21", path=self.path)
+
+        accept.assert_called_once_with("http://email.dacrsc.com/c/invite-one")
+        with history_state(self.path) as state:
+            accepted = state.execute(
+                "SELECT event_date, message_id, status FROM accepted_invites"
+            ).fetchone()
+        self.assertEqual(accepted, ("2026-10-13", "first", "accepted"))
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -309,6 +350,20 @@ class PushTests(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertTrue(second_entered.is_set())
         self.assertEqual(maximum_active_calls, 1)
+
+    def test_playwright_can_select_decline_without_selecting_accept(self):
+        from form_automation.services import _find_response_button
+
+        page = MagicMock()
+        decline_button = MagicMock()
+        page.get_by_role.return_value = decline_button
+        decline_button.count.return_value = 1
+        decline_button.first.is_visible.return_value = True
+
+        found = _find_response_button(page, "decline")
+
+        self.assertIs(found, decline_button.first)
+        self.assertEqual(page.get_by_role.call_args.kwargs["name"].pattern, "^decline$")
 
     def test_service_provider_reuses_service(self):
         from gmail_subscriber.dependencies import get_gmail_service

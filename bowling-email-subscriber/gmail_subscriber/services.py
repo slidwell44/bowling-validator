@@ -6,7 +6,6 @@ import logging
 import secrets
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
@@ -384,9 +383,20 @@ def _process_notification_with_repository(
                                 event_date,
                                 message_id,
                             )
-                        elif repository.was_invite_accepted(message_id):
+                        elif repository.was_invite_accepted(event_date.isoformat()):
                             logger.info(
-                                "DAC invite %s already accepted; skipping", message_id
+                                "DAC invite date %s already reserved or accepted; "
+                                "skipping message %s",
+                                event_date,
+                                message_id,
+                            )
+                        elif not repository.reserve_invite_date(
+                            event_date.isoformat(), message_id
+                        ):
+                            logger.info(
+                                "Another invite already reserved date %s; skipping %s",
+                                event_date,
+                                message_id,
                             )
                         else:
                             logger.info(
@@ -396,7 +406,7 @@ def _process_notification_with_repository(
                             )
                             if accept_invite(invite_url):
                                 repository.record_accepted_invite(
-                                    message_id, datetime.now(UTC).isoformat()
+                                    event_date.isoformat(), message_id
                                 )
                             else:
                                 raise RuntimeError(
