@@ -52,20 +52,24 @@ class GmailSubscriberService:
     def load_credentials() -> Credentials:
         token_json = GmailSettings().TOKEN_JSON
         if token_json:
-            return Credentials.from_authorized_user_info(
+            credentials = Credentials.from_authorized_user_info(
                 json.loads(token_json.get_secret_value()), SCOPES
             )
-        if not TOKEN_FILE.exists():
-            raise RuntimeError(
-                "Gmail is not authorized. Run: uv run python -m scripts.oauth"
+        else:
+            if not TOKEN_FILE.exists():
+                raise RuntimeError(
+                    "Gmail is not authorized. Run: uv run python -m scripts.oauth"
+                )
+            credentials: Credentials = Credentials.from_authorized_user_file(
+                str(TOKEN_FILE), SCOPES
             )
-        credentials: Credentials = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE), SCOPES
-        )
         if not credentials.refresh_token:
             raise RuntimeError(
                 "Gmail refresh token is missing. Run: uv run python -m scripts.oauth"
             )
+        if credentials.expired:
+            logger.info("Refreshing expired Gmail OAuth token")
+            credentials.refresh(Request())
         return credentials
 
     @staticmethod

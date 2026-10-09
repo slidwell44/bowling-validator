@@ -209,6 +209,13 @@ def receive_push(
             "Gmail quota temporarily exceeded; retry later",
             headers={"Retry-After": "60"},
         ) from exc
+    except Exception as exc:
+        logger.exception("Unhandled error processing Pub/Sub delivery %s", delivery_id)
+        raise HTTPException(
+            500,
+            "Internal processing error; check logs",
+            headers={"Retry-After": "300"},
+        ) from exc
     logger.info("Processed Gmail push notification for %s", notification.emailAddress)
     logger.info("Acknowledging Pub/Sub delivery %s with HTTP 204", delivery_id)
     return Response(status_code=204)
