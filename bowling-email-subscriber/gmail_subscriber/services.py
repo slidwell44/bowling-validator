@@ -309,7 +309,12 @@ def _process_notification_with_repository(
         email,
         cursor,
     )
-    page_token = None
+    checkpoint = repository.get_history_checkpoint(email)
+    if checkpoint is None:
+        start_history_id = cursor
+        page_token = None
+    else:
+        start_history_id, page_token = checkpoint
     seen = set()
     while True:
         try:
@@ -318,7 +323,7 @@ def _process_notification_with_repository(
                 .history()
                 .list(
                     userId="me",
-                    startHistoryId=cursor,
+                    startHistoryId=start_history_id,
                     historyTypes=["messageAdded"],
                     pageToken=page_token,
                 )
@@ -414,15 +419,18 @@ def _process_notification_with_repository(
                                     "not confirm; leaving cursor so delivery retries"
                                 )
                 repository.mark_message_inspected(email, message_id)
-        page_token = page.get("nextPageToken")
-        if not page_token:
-            repository.update_history(email, page["historyId"])
-            logger.info(
-                "Advanced Gmail history cursor for %s to %s",
-                email,
-                page["historyId"],
-            )
-            break
+        next_page_token = page.get("nextPageToken")
+        if next_page_token:
+            repository.save_history_checkpoint(email, start_history_id, next_page_token)
+            page_token = next_page_token
+            continue
+        repository.complete_history_sync(email, page["historyId"])
+        logger.info(
+            "Advanced Gmail history cursor for %s to %s",
+            email,
+            page["historyId"],
+        )
+        break
 
 
 def _message_header(message: dict, header_name: str) -> str:

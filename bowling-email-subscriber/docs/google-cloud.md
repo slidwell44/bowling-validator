@@ -129,6 +129,12 @@ Register the watch on the deployed endpoint so its cursor is stored in Neon.
 The application creates these tables automatically in the configured database:
 
 - `mailbox` stores the Gmail history cursor for the watched mailbox.
+- `history_sync_checkpoints` stores the current history start ID and next-page
+  token so a quota retry resumes at the page that failed instead of rereading
+  earlier pages.
+- `history_sync_checkpoints` stores the current Gmail history pagination token.
+  If Gmail rate-limits a multi-page sync, the next Pub/Sub retry resumes at the
+  saved page instead of rereading earlier history pages.
 - `inspected_messages` remembers Gmail messages already fetched while processing
   history. This prevents Pub/Sub retries from rereading the same unrelated or
   already-processed inbox messages.

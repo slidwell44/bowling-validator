@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from googleapiclient.errors import HttpError
 from psycopg import OperationalError
 
 from form_automation.services import is_acceptable_date, parse_dac_invite
@@ -20,6 +21,7 @@ from gmail_subscriber.services import (
     GmailProcessingBusy,
     GmailQuotaExceeded,
     GmailSubscriberService,
+    _process_notification_with_repository,
     history_state,
     is_relevant_subject,
     matching_body,
@@ -213,6 +215,43 @@ class NotificationTests(unittest.TestCase):
         process_notification(self.gmail, "user@example.com", "15", path=self.path)
 
         self.gmail.users().messages().get.assert_not_called()
+
+    def test_history_retry_resumes_from_saved_page_after_quota_error(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        self.gmail.users().history().list().execute.side_effect = [
+            {"history": [], "nextPageToken": "page-2"},
+            HttpError(
+                resp=MagicMock(status=403),
+                content=(b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'),
+                uri="https://gmail.googleapis.com/history",
+            ),
+            {"history": [], "historyId": "25"},
+        ]
+        history_list = self.gmail.users().history().list
+        history_list.reset_mock()
+
+        with history_state(self.path) as connection:
+            repository = MailboxRepository(connection)
+            with self.assertRaises(GmailQuotaExceeded):
+                _process_notification_with_repository(
+                    self.gmail, "user@example.com", "15", repository
+                )
+            self.assertEqual(
+                repository.get_history_checkpoint("user@example.com"),
+                ("10", "page-2"),
+            )
+            _process_notification_with_repository(
+                self.gmail, "user@example.com", "15", repository
+            )
+            self.assertIsNone(repository.get_history_checkpoint("user@example.com"))
+            self.assertEqual(repository.get_history_id("user@example.com"), "25")
+
+        calls = history_list.call_args_list
+        self.assertEqual(
+            [call.kwargs["pageToken"] for call in calls], [None, "page-2", "page-2"]
+        )
+        self.assertTrue(all(call.kwargs["startHistoryId"] == "10" for call in calls))
 
     def test_failure_does_not_advance_cursor(self):
         self.gmail.users().history().list().execute.side_effect = RuntimeError(

@@ -61,6 +61,11 @@ class MailboxRepository:
             "(mailbox_email TEXT PRIMARY KEY, lease_token TEXT NOT NULL, "
             "lease_until REAL NOT NULL)"
         )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS history_sync_checkpoints "
+            "(mailbox_email TEXT PRIMARY KEY, start_history_id TEXT NOT NULL, "
+            "next_page_token TEXT NOT NULL)"
+        )
 
     @classmethod
     @contextmanager
@@ -117,6 +122,41 @@ class MailboxRepository:
             "ELSE history_id END WHERE email = ?",
             (history_id, history_id, email),
         )
+
+    def get_history_checkpoint(self, email: str) -> tuple[str, str] | None:
+        row = self._execute(
+            "SELECT start_history_id, next_page_token "
+            "FROM history_sync_checkpoints WHERE mailbox_email = ?",
+            (email,),
+        ).fetchone()
+        return (row[0], row[1]) if row is not None else None
+
+    def save_history_checkpoint(
+        self, email: str, start_history_id: str, next_page_token: str
+    ) -> None:
+        self._execute(
+            "INSERT INTO history_sync_checkpoints "
+            "(mailbox_email, start_history_id, next_page_token) VALUES (?, ?, ?) "
+            "ON CONFLICT (mailbox_email) DO UPDATE SET "
+            "start_history_id = excluded.start_history_id, "
+            "next_page_token = excluded.next_page_token",
+            (email, start_history_id, next_page_token),
+        )
+
+    def complete_history_sync(self, email: str, history_id: str) -> None:
+        update_query = (
+            "UPDATE mailbox SET history_id = CASE "
+            "WHEN CAST(history_id AS NUMERIC) < CAST(? AS NUMERIC) THEN ? "
+            "ELSE history_id END WHERE email = ?"
+        )
+        delete_query = "DELETE FROM history_sync_checkpoints WHERE mailbox_email = ?"
+        try:
+            self._execute_without_commit(update_query, (history_id, history_id, email))
+            self._execute_without_commit(delete_query, (email,))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def record_processed_message(
         self,
@@ -229,18 +269,12 @@ class MailboxRepository:
         )
 
     def _execute(self, query: str, parameters: tuple[Any, ...]):
+        cursor = self._execute_without_commit(query, parameters)
+        self.connection.commit()
+        return cursor
+
+    def _execute_without_commit(self, query: str, parameters: tuple[Any, ...]):
         if isinstance(self.connection, psycopg.Connection):
             query = query.replace("?", "%s")
         connection: Any = self.connection
-        try:
-            cursor = connection.execute(query, parameters)
-            connection.commit()
-            return cursor
-        except Exception:
-            try:
-                connection.rollback()
-            except Exception:
-                logger.exception(
-                    "Database rollback failed; preserving the original exception"
-                )
-            raise
+        return connection.execute(query, parameters)
