@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 class PubSubMessage(BaseModel):
     data: str
+    message_id: str | None = Field(default=None, alias="messageId")
 
 
 class PubSubEnvelope(BaseModel):
@@ -80,6 +81,8 @@ def receive_push(
         GmailSubscriberService, Depends(provide_gmail_subscriber_service)
     ],
 ):
+    delivery_id = envelope.message.message_id or "unknown"
+    logger.info("Received authenticated Pub/Sub delivery %s", delivery_id)
     try:
         notification = GmailNotification.model_validate_json(
             base64.urlsafe_b64decode(
@@ -97,20 +100,27 @@ def receive_push(
     try:
         service.process_notification(notification.emailAddress, notification.historyId)
     except GmailProcessingBusy as exc:
-        logger.info("Mailbox processing is already active; asking Pub/Sub to retry")
+        logger.info(
+            "Deferring Pub/Sub delivery %s: mailbox processing is active",
+            delivery_id,
+        )
         raise HTTPException(
             503,
             "Mailbox processing is already active; retry later",
             headers={"Retry-After": "30"},
         ) from exc
     except GmailQuotaExceeded as exc:
-        logger.warning("Gmail quota reached; asking Pub/Sub to retry with backoff")
+        logger.warning(
+            "Deferring Pub/Sub delivery %s: Gmail quota reached; retry after 60s",
+            delivery_id,
+        )
         raise HTTPException(
             503,
             "Gmail quota temporarily exceeded; retry later",
             headers={"Retry-After": "60"},
         ) from exc
     logger.info("Processed Gmail push notification for %s", notification.emailAddress)
+    logger.info("Acknowledging Pub/Sub delivery %s with HTTP 204", delivery_id)
     return Response(status_code=204)
 
 

@@ -491,7 +491,7 @@ class PushTests(unittest.TestCase):
         data = base64.b64encode(
             json.dumps({"emailAddress": "user@example.com", "historyId": "15"}).encode()
         ).decode()
-        envelope = {"message": {"data": data}}
+        envelope = {"message": {"data": data, "messageId": "pubsub-123"}}
         headers = {"Authorization": "Bearer token"}
         with (
             patch(
@@ -510,11 +510,22 @@ class PushTests(unittest.TestCase):
                 401,
             )
             verify.side_effect = None
-            self.assertEqual(
-                client.post(
+            with self.assertLogs("gmail_subscriber.endpoints", level="INFO") as logs:
+                response = client.post(
                     "/gmail-subscriber/push", json=envelope, headers=headers
-                ).status_code,
-                204,
+                )
+            self.assertEqual(response.status_code, 204)
+            self.assertTrue(
+                any(
+                    "Received authenticated Pub/Sub delivery pubsub-123" in log
+                    for log in logs.output
+                )
+            )
+            self.assertTrue(
+                any(
+                    "Acknowledging Pub/Sub delivery pubsub-123 with HTTP 204" in log
+                    for log in logs.output
+                )
             )
             service.process_notification.assert_called_once_with(
                 "user@example.com", "15"
