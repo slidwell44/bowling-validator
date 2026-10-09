@@ -15,6 +15,9 @@ gcloud run deploy "${SERVICE_NAME}" \
   --platform=managed \
   --region="${REGION}" \
   --allow-unauthenticated \
+  --memory=1Gi \
+  --cpu=1 \
+  --timeout=300 \
   --set-env-vars="GMAIL_PUBSUB_TOPIC=projects/bowling-subscriber/topics/gmail-inbox" \
   --set-secrets="DATABASE_URL=DATABASE_URL:latest,GMAIL_TOKEN_JSON=GMAIL_TOKEN_JSON:latest,GMAIL_PUSH_AUDIENCE=GMAIL_PUSH_AUDIENCE:latest,GMAIL_PUSH_SERVICE_ACCOUNT=GMAIL_PUSH_SERVICE_ACCOUNT:latest,GMAIL_WATCH_AUDIENCE=GMAIL_WATCH_AUDIENCE:latest,GMAIL_WATCH_SERVICE_ACCOUNT=GMAIL_WATCH_SERVICE_ACCOUNT:latest" \
   --project="${PROJECT_ID}"

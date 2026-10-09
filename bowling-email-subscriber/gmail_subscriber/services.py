@@ -81,7 +81,17 @@ class GmailSubscriberService:
         )
         if not audience or not email:
             raise RuntimeError("Google delivery identity settings are not configured")
-        claims = id_token.verify_oauth2_token(token, Request(), audience=audience)
+        logger.info("Verifying token with audience=%s, email=%s", audience, email)
+        try:
+            claims = id_token.verify_oauth2_token(token, Request(), audience=audience)
+            logger.info(
+                "Token claims: email=%s, email_verified=%s",
+                claims.get("email"),
+                claims.get("email_verified"),
+            )
+        except Exception as exc:
+            logger.error("Token verification failed: %s", exc)
+            raise
         if claims.get("email") != email or claims.get("email_verified") is not True:
             raise ValueError("Unexpected Google service account")
 
