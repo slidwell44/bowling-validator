@@ -271,7 +271,10 @@ class NotificationTests(unittest.TestCase):
         self.gmail.users().getProfile().execute.return_value = {
             "emailAddress": "user@example.com"
         }
-        self.gmail.users().watch().execute.return_value = {"historyId": "30"}
+        self.gmail.users().watch().execute.return_value = {
+            "historyId": "30",
+            "expiration": "1893456000000",
+        }
         start_watch(self.gmail, "projects/test/topics/mail", path=self.path)
         with history_state(self.path) as state:
             row = state.execute("SELECT history_id FROM mailbox").fetchone()

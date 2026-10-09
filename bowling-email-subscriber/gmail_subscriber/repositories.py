@@ -16,6 +16,30 @@ SCHEMA_LOCK_ID = 724938202
 logger = logging.getLogger(__name__)
 
 
+class DatabaseUnavailable(Exception):
+    """Raised when the configured database cannot be reached after retries."""
+
+
+def _connect_postgres(url: str):
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            return psycopg.connect(url, connect_timeout=15)
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            wait = 2**attempt
+            logger.warning(
+                "Database connect attempt %d failed; retrying in %ds: %s",
+                attempt + 1,
+                wait,
+                exc,
+            )
+            time.sleep(wait)
+    raise DatabaseUnavailable(
+        f"Could not connect to the database after 4 attempts: {last_error}"
+    ) from last_error
+
+
 class MailboxRepository:
     def __init__(self, connection: Any) -> None:
         self.connection = connection
@@ -66,6 +90,11 @@ class MailboxRepository:
             "(mailbox_email TEXT PRIMARY KEY, start_history_id TEXT NOT NULL, "
             "next_page_token TEXT NOT NULL)"
         )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS watch_state "
+            "(mailbox_email TEXT PRIMARY KEY, expiration_ms BIGINT NOT NULL, "
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
 
     @classmethod
     @contextmanager
@@ -75,7 +104,7 @@ class MailboxRepository:
         if settings.TOKEN_JSON and not database_url:
             raise RuntimeError("DATABASE_URL is required with cloud Gmail credentials")
         connection = (
-            psycopg.connect(database_url.get_secret_value(), connect_timeout=10)
+            _connect_postgres(database_url.get_secret_value())
             if database_url
             else sqlite3.connect(path, timeout=30)
         )
@@ -99,6 +128,22 @@ class MailboxRepository:
             raise
         finally:
             connection.close()
+
+    def save_watch_expiration(self, email: str, expiration_ms: int) -> None:
+        self._execute(
+            "INSERT INTO watch_state (mailbox_email, expiration_ms) VALUES (?, ?) "
+            "ON CONFLICT (mailbox_email) DO UPDATE SET "
+            "expiration_ms = excluded.expiration_ms, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (email, expiration_ms),
+        )
+
+    def get_watch_expiration(self, email: str) -> int | None:
+        row = self._execute(
+            "SELECT expiration_ms FROM watch_state WHERE mailbox_email = ?",
+            (email,),
+        ).fetchone()
+        return int(row[0]) if row is not None else None
 
     def get_history_id(self, email: str) -> str | None:
         row = self._execute(

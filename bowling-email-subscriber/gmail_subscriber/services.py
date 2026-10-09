@@ -255,6 +255,7 @@ def start_watch(
     if reset_history:
         repository.reset_history(email)
     repository.save_initial_history(email, result["historyId"])
+    repository.save_watch_expiration(email, int(result["expiration"]))
     return result
 
 
@@ -368,6 +369,12 @@ def _process_notification_with_repository(
                         ) from exc
                     raise
                 subject, body = message_subject_and_body(message)
+                if not is_relevant_subject(subject):
+                    logger.info(
+                        "Skipping message %s with non-matching subject %r",
+                        message_id,
+                        subject,
+                    )
                 if is_relevant_subject(subject):
                     inserted = repository.record_processed_message(
                         message_id, email, subject, body, history_id
