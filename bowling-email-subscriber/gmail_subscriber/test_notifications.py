@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import date
 from email.message import EmailMessage
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -13,11 +14,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from psycopg import OperationalError
 
-from datetime import date
-
 from form_automation.services import is_acceptable_date, parse_dac_invite
 from gmail_subscriber.endpoints import router
 from gmail_subscriber.services import (
+    GmailProcessingBusy,
     GmailQuotaExceeded,
     GmailSubscriberService,
     history_state,
@@ -213,6 +213,51 @@ class NotificationTests(unittest.TestCase):
 
 
 class PushTests(unittest.TestCase):
+    def test_quota_failure_puts_mailbox_in_distributed_cooldown(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            with history_state(path) as connection:
+                repository = MailboxRepository(connection)
+                with patch(
+                    "gmail_subscriber.services._process_notification_with_repository",
+                    side_effect=GmailQuotaExceeded("quota"),
+                ) as process:
+                    with self.assertRaises(GmailQuotaExceeded):
+                        process_notification(
+                            MagicMock(),
+                            "user@example.com",
+                            "15",
+                            repository,
+                        )
+                    with self.assertRaises(GmailProcessingBusy):
+                        process_notification(
+                            MagicMock(),
+                            "user@example.com",
+                            "15",
+                            repository,
+                        )
+                    process.assert_called_once()
+
+    def test_database_lease_excludes_another_owner(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            with history_state(path) as connection:
+                repository = MailboxRepository(connection)
+                self.assertTrue(
+                    repository.acquire_processing_lease("user@example.com", "first")
+                )
+                self.assertFalse(
+                    repository.acquire_processing_lease("user@example.com", "second")
+                )
+                repository.release_processing_lease("user@example.com", "first")
+                self.assertTrue(
+                    repository.acquire_processing_lease("user@example.com", "second")
+                )
+
     def test_gmail_service_calls_are_serialized(self):
         service = GmailSubscriberService(
             repository=MagicMock(), gmail_service=MagicMock()
@@ -387,6 +432,13 @@ class PushTests(unittest.TestCase):
             self.assertEqual(quota_response.status_code, 503)
             self.assertEqual(quota_response.headers["retry-after"], "60")
             service.process_notification.side_effect = None
+            service.process_notification.side_effect = GmailProcessingBusy("busy")
+            busy_response = client.post(
+                "/gmail-subscriber/push", json=envelope, headers=headers
+            )
+            self.assertEqual(busy_response.status_code, 503)
+            self.assertEqual(busy_response.headers["retry-after"], "30")
+            service.process_notification.side_effect = None
             service.process_notification.reset_mock()
             urlsafe_data = (
                 base64.urlsafe_b64encode(
@@ -507,9 +559,7 @@ class DacInviteTests(unittest.TestCase):
     def test_ignores_pixel_only_body(self):
         self.assertIsNone(
             parse_dac_invite(
-                dac_raw_email(
-                    body='<img src="http://email.dacrsc.com/o/xyz789">'
-                )
+                dac_raw_email(body='<img src="http://email.dacrsc.com/o/xyz789">')
             )
         )
 

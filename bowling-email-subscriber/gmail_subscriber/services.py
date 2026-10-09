@@ -4,8 +4,9 @@ import base64
 import json
 import logging
 import secrets
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
@@ -19,9 +20,13 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from config import GmailSettings
+from form_automation.services import (
+    accept_invite,
+    is_acceptable_date,
+    parse_dac_invite_content,
+)
 from gmail_subscriber.repositories import STATE_FILE, MailboxRepository
 from scripts.oauth import SCOPES, TOKEN_FILE
-from form_automation.services import accept_invite, is_acceptable_date, parse_dac_invite
 
 if TYPE_CHECKING:
     from googleapiclient._apis.gmail.v1 import GmailResource
@@ -116,6 +121,10 @@ class GmailSubscriberService:
 
 class GmailQuotaExceeded(Exception):
     """Raised when Gmail rejects a request for exceeding its query quota."""
+
+
+class GmailProcessingBusy(Exception):
+    """Raised when another replica currently owns this mailbox's processing lease."""
 
 
 SUBJECT_MARKER = "Substitute bowler request"
@@ -227,51 +236,26 @@ def start_watch(
             return start_watch(
                 gmail, topic, repository_context, reset_history=reset_history
             )
-    else:
-        email = (
-            gmail.users()
-            .getProfile(userId="me")
-            .execute(num_retries=GMAIL_HTTP_RETRIES)["emailAddress"]
+    email = (
+        gmail.users()
+        .getProfile(userId="me")
+        .execute(num_retries=GMAIL_HTTP_RETRIES)["emailAddress"]
+    )
+    result = (
+        gmail.users()
+        .watch(
+            userId="me",
+            body={
+                "topicName": topic,
+                "labelIds": ["INBOX"],
+                "labelFilterBehavior": "include",
+            },
         )
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS accepted_invites "
-            "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL)"
-        )
-        if not database_url:
-            connection.execute("BEGIN IMMEDIATE")
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def _execute(connection, query, parameters):
-    if isinstance(connection, psycopg.Connection):
-        query = query.replace("?", "%s")
-    return connection.execute(query, parameters)
-
-
-def start_watch(gmail, topic: str, *, reset_history=False, path=STATE_FILE):
-    with history_state(path) as state:
-        email = gmail.users().getProfile(userId="me").execute()["emailAddress"]
-        result = (
-            gmail.users()
-            .watch(
-                userId="me",
-                body={
-                    "topicName": topic,
-                    "labelIds": ["INBOX"],
-                    "labelFilterBehavior": "include",
-                },
-            )
-            .execute(num_retries=GMAIL_HTTP_RETRIES)
-        )
-        if reset_history:
-            repository.reset_history(email)
-        repository.save_initial_history(email, result["historyId"])
+        .execute(num_retries=GMAIL_HTTP_RETRIES)
+    )
+    if reset_history:
+        repository.reset_history(email)
+    repository.save_initial_history(email, result["historyId"])
     return result
 
 
@@ -283,111 +267,126 @@ def process_notification(
     *,
     path=STATE_FILE,
 ):
-    # Serialize deliveries and persist progress only after every page succeeds.
     if repository is None:
         with MailboxRepository.from_settings(path) as repository_context:
             return process_notification(gmail, email, history_id, repository_context)
-    else:
-        cursor = repository.get_history_id(email)
-        if cursor is None:
-            raise RuntimeError(
-                "Mailbox watch is not initialized. Run python -m scripts.watch."
-            )
-        if int(history_id) <= int(cursor):
-            logger.info(
-                "Skipping Gmail history %s for %s; cursor is already %s",
-                history_id,
-                email,
-                cursor,
-            )
-            return
+    lease_token = uuid.uuid4().hex
+    if not repository.acquire_processing_lease(email, lease_token):
+        raise GmailProcessingBusy("Mailbox is already processing or in quota cooldown")
+    try:
+        return _process_notification_with_repository(
+            gmail, email, history_id, repository
+        )
+    except GmailQuotaExceeded:
+        try:
+            repository.defer_processing_lease(email, lease_token, delay_seconds=60)
+        except Exception:
+            logger.exception("Could not persist Gmail quota cooldown")
+        raise
+    finally:
+        repository.release_processing_lease(email, lease_token)
+
+
+def _process_notification_with_repository(
+    gmail, email: str, history_id: str, repository: MailboxRepository
+):
+    # Persist progress only after every history page succeeds.
+    cursor = repository.get_history_id(email)
+    if cursor is None:
+        raise RuntimeError(
+            "Mailbox watch is not initialized. Run python -m scripts.watch."
+        )
+    if int(history_id) <= int(cursor):
         logger.info(
-            "Processing Gmail history %s for %s from cursor %s",
+            "Skipping Gmail history %s for %s; cursor is already %s",
             history_id,
             email,
             cursor,
         )
-        page_token = None
-        seen = set()
-        while True:
-            try:
-                page = (
-                    gmail.users()
-                    .history()
-                    .list(
-                        userId="me",
-                        startHistoryId=cursor,
-                        historyTypes=["messageAdded"],
-                        pageToken=page_token,
-                    )
-                    .execute(num_retries=GMAIL_HTTP_RETRIES)
+        return
+    logger.info(
+        "Processing Gmail history %s for %s from cursor %s",
+        history_id,
+        email,
+        cursor,
+    )
+    page_token = None
+    seen = set()
+    while True:
+        try:
+            page = (
+                gmail.users()
+                .history()
+                .list(
+                    userId="me",
+                    startHistoryId=cursor,
+                    historyTypes=["messageAdded"],
+                    pageToken=page_token,
                 )
-            except HttpError as exc:
-                if exc.resp.status == 404:
-                    logger.error(
-                        "Gmail history expired. Run python -m scripts.watch --reset-history "
-                        "to resume from now; intervening messages will not be replayed."
+                .execute(num_retries=GMAIL_HTTP_RETRIES)
+            )
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                logger.error(
+                    "Gmail history expired. Run python -m scripts.watch --reset-history "
+                    "to resume from now; intervening messages will not be replayed."
+                )
+            if is_gmail_quota_error(exc):
+                raise GmailQuotaExceeded(
+                    "Gmail query quota exceeded while listing mailbox history"
+                ) from exc
+            raise
+        for event in page.get("history", []):
+            for added in event.get("messagesAdded", []):
+                listed_message = added["message"]
+                message_id = listed_message["id"]
+                if message_id in seen or "INBOX" not in listed_message.get(
+                    "labelIds", []
+                ):
+                    continue
+                seen.add(message_id)
+                if repository.was_message_inspected(email, message_id):
+                    continue
+                try:
+                    message = (
+                        gmail.users()
+                        .messages()
+                        .get(userId="me", id=message_id, format="full")
+                        .execute(num_retries=GMAIL_HTTP_RETRIES)
                     )
-                if is_gmail_quota_error(exc):
-                    raise GmailQuotaExceeded(
-                        "Gmail query quota exceeded while listing mailbox history"
-                    ) from exc
-                raise
-            for event in page.get("history", []):
-                for added in event.get("messagesAdded", []):
-                    message = added["message"]
-                    message_id = message["id"]
-                    if message_id in seen or "INBOX" not in message.get("labelIds", []):
-                        continue
-                    seen.add(message_id)
-                    if repository.was_message_inspected(email, message_id):
-                        continue
-                    try:
-                        message = (
-                            gmail.users()
-                            .messages()
-                            .get(userId="me", id=message_id, format="full")
-                            .execute(num_retries=GMAIL_HTTP_RETRIES)
-                        )
-                    except HttpError as exc:
-                        if exc.resp.status == 404:
-                            continue  # The message was deleted before delivery.
-                        if is_gmail_quota_error(exc):
-                            raise GmailQuotaExceeded(
-                                "Gmail query quota exceeded while reading a message"
-                            ) from exc
-                        raise
-                    subject, body = message_subject_and_body(message)
-                    if not is_relevant_subject(subject):
+                except HttpError as exc:
+                    if exc.resp.status == 404:
                         repository.mark_message_inspected(email, message_id)
-                        continue
+                        continue  # The message was deleted before delivery.
+                    if is_gmail_quota_error(exc):
+                        raise GmailQuotaExceeded(
+                            "Gmail query quota exceeded while reading a message"
+                        ) from exc
+                    raise
+                subject, body = message_subject_and_body(message)
+                if is_relevant_subject(subject):
                     inserted = repository.record_processed_message(
                         message_id, email, subject, body, history_id
                     )
-                    repository.mark_message_inspected(email, message_id)
                     if inserted:
                         print(
                             f"\n--- Gmail message {message_id}: {subject} ---\n{body}\n",
                             flush=True,
                         )
-                    invite = parse_dac_invite(raw)
+                    invite = parse_dac_invite_content(
+                        _message_header(message, "from"), subject, body
+                    )
                     if invite is not None:
                         invite_url, event_date = invite
-                        already = _execute(
-                            state,
-                            "SELECT 1 FROM accepted_invites WHERE message_id = ?",
-                            (message_id,),
-                        ).fetchone()
                         if not is_acceptable_date(event_date):
                             logger.info(
                                 "Skipping DAC invite for past date %s (%s)",
                                 event_date,
                                 message_id,
                             )
-                        elif already:
+                        elif repository.was_invite_accepted(message_id):
                             logger.info(
-                                "DAC invite %s already accepted; skipping",
-                                message_id,
+                                "DAC invite %s already accepted; skipping", message_id
                             )
                         else:
                             logger.info(
@@ -396,26 +395,32 @@ def process_notification(
                                 message_id,
                             )
                             if accept_invite(invite_url):
-                                _execute(
-                                    state,
-                                    "INSERT INTO accepted_invites "
-                                    "(message_id, accepted_at) VALUES (?, ?)",
-                                    (
-                                        message_id,
-                                        datetime.now(timezone.utc).isoformat(),
-                                    ),
+                                repository.record_accepted_invite(
+                                    message_id, datetime.now(UTC).isoformat()
                                 )
                             else:
                                 raise RuntimeError(
                                     f"DAC invite {message_id} accepted-click did "
                                     "not confirm; leaving cursor so delivery retries"
                                 )
-            page_token = page.get("nextPageToken")
-            if not page_token:
-                repository.update_history(email, page["historyId"])
-                logger.info(
-                    "Advanced Gmail history cursor for %s to %s",
-                    email,
-                    page["historyId"],
-                )
-                break
+                repository.mark_message_inspected(email, message_id)
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            repository.update_history(email, page["historyId"])
+            logger.info(
+                "Advanced Gmail history cursor for %s to %s",
+                email,
+                page["historyId"],
+            )
+            break
+
+
+def _message_header(message: dict, header_name: str) -> str:
+    return next(
+        (
+            header.get("value", "")
+            for header in message.get("payload", {}).get("headers", [])
+            if header.get("name", "").lower() == header_name.lower()
+        ),
+        "",
+    )

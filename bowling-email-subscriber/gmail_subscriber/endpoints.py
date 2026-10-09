@@ -7,7 +7,11 @@ from google.auth.exceptions import GoogleAuthError
 from pydantic import BaseModel, Field, field_validator
 
 from gmail_subscriber.dependencies import provide_gmail_subscriber_service
-from gmail_subscriber.services import GmailQuotaExceeded, GmailSubscriberService
+from gmail_subscriber.services import (
+    GmailProcessingBusy,
+    GmailQuotaExceeded,
+    GmailSubscriberService,
+)
 
 router = APIRouter(prefix="/gmail-subscriber")
 logger = logging.getLogger(__name__)
@@ -92,6 +96,13 @@ def receive_push(
     )
     try:
         service.process_notification(notification.emailAddress, notification.historyId)
+    except GmailProcessingBusy as exc:
+        logger.info("Mailbox processing is already active; asking Pub/Sub to retry")
+        raise HTTPException(
+            503,
+            "Mailbox processing is already active; retry later",
+            headers={"Retry-After": "30"},
+        ) from exc
     except GmailQuotaExceeded as exc:
         logger.warning("Gmail quota reached; asking Pub/Sub to retry with backoff")
         raise HTTPException(

@@ -56,9 +56,26 @@ def parse_dac_invite(raw: str) -> tuple[str, date] | None:
     message: EmailMessage = BytesParser(policy=policy.default).parsebytes(
         base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
     )
-    if DAC_SENDER not in str(message.get("From", "")):
+    for preferences in (("plain", "html"), ("html",)):
+        body_part = message.get_body(preferencelist=preferences)
+        if body_part is not None:
+            result = parse_dac_invite_content(
+                str(message.get("From", "")),
+                str(message.get("Subject", "")).strip(),
+                body_part.get_content(),
+            )
+            if result is not None:
+                return result
+    return None
+
+
+def parse_dac_invite_content(
+    sender: str, subject: str, body: str
+) -> tuple[str, date] | None:
+    """Parse DAC invite metadata from already-decoded Gmail message fields."""
+    if DAC_SENDER not in sender:
         return None
-    subject = str(message.get("Subject", "")).strip()
+    subject = subject.strip()
     match = REQUEST_SUBJECT_RE.match(subject)
     if not match:
         return None
@@ -68,13 +85,9 @@ def parse_dac_invite(raw: str) -> tuple[str, date] | None:
     except ValueError:
         logger.warning("Unparseable event date in DAC subject: %r", subject)
         return None
-    for preferences in (("plain", "html"), ("html",)):
-        body = message.get_body(preferencelist=preferences)
-        if body is None:
-            continue
-        found = INVITE_URL_RE.search(body.get_content())
-        if found:
-            return found.group(0).rstrip(".,;)"), event_date
+    found = INVITE_URL_RE.search(body)
+    if found:
+        return found.group(0).rstrip(".,;)"), event_date
     logger.warning("DAC invite email had no accept URL (subject=%r)", subject)
     return None
 
@@ -122,8 +135,8 @@ def accept_invite(invite_url: str, *, timeout_ms: int = 30000) -> bool:
 def _find_accept_button(page):  # type: ignore[no-untyped-def]
     """Return a locator for the Accept button, never the Decline one."""
     attempts = [
-        lambda: page.get_by_role("button", name=re.compile(r"^accept$", re.I)),
-        lambda: page.get_by_role("link", name=re.compile(r"^accept$", re.I)),
+        lambda: page.get_by_role("button", name=re.compile(r"^accept$", re.IGNORECASE)),
+        lambda: page.get_by_role("link", name=re.compile(r"^accept$", re.IGNORECASE)),
         lambda: page.locator('input[type="submit"][value="Accept"]'),
         lambda: page.locator('input[type="button"][value="Accept"]'),
     ]
@@ -132,6 +145,7 @@ def _find_accept_button(page):  # type: ignore[no-untyped-def]
             locator = attempt()
             if locator.count() > 0 and locator.first.is_visible():
                 return locator.first
-        except Exception:  # noqa: BLE001 - try the next selector
+        except Exception as exc:  # noqa: BLE001 - try the next selector
+            logger.debug("Accept-button selector failed: %s", exc)
             continue
     return None

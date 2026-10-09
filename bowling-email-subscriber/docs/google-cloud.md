@@ -132,6 +132,9 @@ The application creates these tables automatically in the configured database:
 - `inspected_messages` remembers Gmail messages already fetched while processing
   history. This prevents Pub/Sub retries from rereading the same unrelated or
   already-processed inbox messages.
+- `mailbox_processing_leases` coordinates push processing across app replicas.
+  It also holds a short cooldown after Gmail quota exhaustion, so retries do not
+  immediately issue another Gmail request from a different replica.
 - `processed_messages` stores each successfully processed substitute-bowler
   request, including its Gmail message ID, mailbox, subject, body, history ID,
   and processing timestamp. The message ID is unique, so Pub/Sub retries do
@@ -154,9 +157,11 @@ Pub/Sub notifications contain mailbox history, not the email subject, so
 Pub/Sub filters cannot filter by subject or body.
 
 HTTP 204 acknowledges a notification. Gmail quota exhaustion returns HTTP 503
-with `Retry-After: 60`, allowing Pub/Sub to back off and retry. Successfully
-inspected messages are skipped during those retries, and PostgreSQL cursor
-updates cannot move backward. PostgreSQL preserves the cursor across deployments.
+with `Retry-After: 60`, allowing Pub/Sub to back off and retry. Only one replica
+processes a mailbox at a time; quota errors place that mailbox in a 60-second
+database-backed cooldown. Successfully inspected messages are skipped during
+retries, and PostgreSQL cursor updates cannot move backward. PostgreSQL
+preserves the cursor across deployments.
 
 If Gmail history expires, reset the cursor intentionally with matching cloud
 credentials:

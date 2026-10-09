@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,15 @@ class MailboxRepository:
             "(mailbox_email TEXT NOT NULL, message_id TEXT NOT NULL, "
             "inspected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
             "PRIMARY KEY (mailbox_email, message_id))"
+        )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS accepted_invites "
+            "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS mailbox_processing_leases "
+            "(mailbox_email TEXT PRIMARY KEY, lease_token TEXT NOT NULL, "
+            "lease_until REAL NOT NULL)"
         )
 
     @classmethod
@@ -124,6 +134,51 @@ class MailboxRepository:
             "INSERT INTO inspected_messages (mailbox_email, message_id) "
             "VALUES (?, ?) ON CONFLICT (mailbox_email, message_id) DO NOTHING",
             (mailbox_email, message_id),
+        )
+
+    def was_invite_accepted(self, message_id: str) -> bool:
+        return (
+            self._execute(
+                "SELECT 1 FROM accepted_invites WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            is not None
+        )
+
+    def record_accepted_invite(self, message_id: str, accepted_at: str) -> None:
+        self._execute(
+            "INSERT INTO accepted_invites (message_id, accepted_at) "
+            "VALUES (?, ?) ON CONFLICT (message_id) DO NOTHING",
+            (message_id, accepted_at),
+        )
+
+    def acquire_processing_lease(
+        self, mailbox_email: str, lease_token: str, *, lease_seconds: int = 180
+    ) -> bool:
+        now = time.time()
+        result = self._execute(
+            "INSERT INTO mailbox_processing_leases "
+            "(mailbox_email, lease_token, lease_until) VALUES (?, ?, ?) "
+            "ON CONFLICT (mailbox_email) DO UPDATE SET "
+            "lease_token = excluded.lease_token, lease_until = excluded.lease_until "
+            "WHERE mailbox_processing_leases.lease_until <= ?",
+            (mailbox_email, lease_token, now + lease_seconds, now),
+        )
+        return bool(result.rowcount)
+
+    def defer_processing_lease(
+        self, mailbox_email: str, lease_token: str, *, delay_seconds: int = 60
+    ) -> None:
+        self._execute(
+            "UPDATE mailbox_processing_leases SET lease_token = ?, lease_until = ? "
+            "WHERE mailbox_email = ? AND lease_token = ?",
+            ("cooldown", time.time() + delay_seconds, mailbox_email, lease_token),
+        )
+
+    def release_processing_lease(self, mailbox_email: str, lease_token: str) -> None:
+        self._execute(
+            "DELETE FROM mailbox_processing_leases "
+            "WHERE mailbox_email = ? AND lease_token = ?",
+            (mailbox_email, lease_token),
         )
 
     def _execute(self, query: str, parameters: tuple[Any, ...]):
