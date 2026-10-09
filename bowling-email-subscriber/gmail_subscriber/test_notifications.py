@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import date
 from email.message import EmailMessage
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -11,14 +12,16 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from googleapiclient.errors import HttpError
 from psycopg import OperationalError
-
-from datetime import date
 
 from form_automation.services import is_acceptable_date, parse_dac_invite
 from gmail_subscriber.endpoints import router
 from gmail_subscriber.services import (
+    GmailProcessingBusy,
+    GmailQuotaExceeded,
     GmailSubscriberService,
+    _process_notification_with_repository,
     history_state,
     is_relevant_subject,
     matching_body,
@@ -42,11 +45,18 @@ def raw_email(subject="Substitute bowler request"):
     return base64.urlsafe_b64encode(message.as_bytes()).decode().rstrip("=")
 
 
-def api_message(subject="Substitute bowler request", body="Plain body"):
+def api_message(
+    subject="Substitute bowler request",
+    body="Plain body",
+    sender="DAC Mail <dacmail@dacrsc.com>",
+):
     encoded_body = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
     return {
         "payload": {
-            "headers": [{"name": "Subject", "value": subject}],
+            "headers": [
+                {"name": "Subject", "value": subject},
+                {"name": "From", "value": sender},
+            ],
             "mimeType": "multipart/mixed",
             "parts": [
                 {
@@ -99,6 +109,40 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(subject, "Substitute bowler request")
         self.assertEqual(body, "Request body")
 
+    def test_auto_accepts_only_one_invite_for_each_event_date(self):
+        first = {"message": {"id": "first", "labelIds": ["INBOX"]}}
+        second = {"message": {"id": "second", "labelIds": ["INBOX"]}}
+        self.gmail.users().history().list().execute.side_effect = [
+            {"history": [{"messagesAdded": [first]}], "historyId": "20"},
+            {"history": [{"messagesAdded": [second]}], "historyId": "21"},
+        ]
+        self.gmail.users().messages().get().execute.side_effect = [
+            api_message(
+                subject="Substitute bowler request for Player One; 10/13/2026",
+                body="Please accept: http://email.dacrsc.com/c/invite-one",
+            ),
+            api_message(
+                subject="Substitute bowler request for Player Two; 10/13/2026",
+                body="Please accept: http://email.dacrsc.com/c/invite-two",
+            ),
+        ]
+        with (
+            patch(
+                "gmail_subscriber.services.accept_invite", return_value=True
+            ) as accept,
+            patch("gmail_subscriber.services.is_acceptable_date", return_value=True),
+            redirect_stdout(io.StringIO()),
+        ):
+            process_notification(self.gmail, "user@example.com", "15", path=self.path)
+            process_notification(self.gmail, "user@example.com", "21", path=self.path)
+
+        accept.assert_called_once_with("http://email.dacrsc.com/c/invite-one")
+        with history_state(self.path) as state:
+            accepted = state.execute(
+                "SELECT event_date, message_id, status FROM accepted_invites"
+            ).fetchone()
+        self.assertEqual(accepted, ("2026-10-13", "first", "accepted"))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -150,6 +194,64 @@ class NotificationTests(unittest.TestCase):
                     "15",
                 ),
             )
+            inspected = state.execute(
+                "SELECT mailbox_email, message_id FROM inspected_messages"
+            ).fetchone()
+            self.assertEqual(inspected, ("user@example.com", "one"))
+
+    def test_retry_skips_messages_already_inspected(self):
+        with history_state(self.path) as state:
+            state.execute(
+                "INSERT INTO inspected_messages (mailbox_email, message_id) "
+                "VALUES ('user@example.com', 'one')"
+            )
+        self.gmail.users().history().list().execute.return_value = {
+            "history": [
+                {"messagesAdded": [{"message": {"id": "one", "labelIds": ["INBOX"]}}]}
+            ],
+            "historyId": "20",
+        }
+
+        process_notification(self.gmail, "user@example.com", "15", path=self.path)
+
+        self.gmail.users().messages().get.assert_not_called()
+
+    def test_history_retry_resumes_from_saved_page_after_quota_error(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        self.gmail.users().history().list().execute.side_effect = [
+            {"history": [], "nextPageToken": "page-2"},
+            HttpError(
+                resp=MagicMock(status=403),
+                content=(b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'),
+                uri="https://gmail.googleapis.com/history",
+            ),
+            {"history": [], "historyId": "25"},
+        ]
+        history_list = self.gmail.users().history().list
+        history_list.reset_mock()
+
+        with history_state(self.path) as connection:
+            repository = MailboxRepository(connection)
+            with self.assertRaises(GmailQuotaExceeded):
+                _process_notification_with_repository(
+                    self.gmail, "user@example.com", "15", repository
+                )
+            self.assertEqual(
+                repository.get_history_checkpoint("user@example.com"),
+                ("10", "page-2"),
+            )
+            _process_notification_with_repository(
+                self.gmail, "user@example.com", "15", repository
+            )
+            self.assertIsNone(repository.get_history_checkpoint("user@example.com"))
+            self.assertEqual(repository.get_history_id("user@example.com"), "25")
+
+        calls = history_list.call_args_list
+        self.assertEqual(
+            [call.kwargs["pageToken"] for call in calls], [None, "page-2", "page-2"]
+        )
+        self.assertTrue(all(call.kwargs["startHistoryId"] == "10" for call in calls))
 
     def test_failure_does_not_advance_cursor(self):
         self.gmail.users().history().list().execute.side_effect = RuntimeError(
@@ -169,7 +271,10 @@ class NotificationTests(unittest.TestCase):
         self.gmail.users().getProfile().execute.return_value = {
             "emailAddress": "user@example.com"
         }
-        self.gmail.users().watch().execute.return_value = {"historyId": "30"}
+        self.gmail.users().watch().execute.return_value = {
+            "historyId": "30",
+            "expiration": "1893456000000",
+        }
         start_watch(self.gmail, "projects/test/topics/mail", path=self.path)
         with history_state(self.path) as state:
             row = state.execute("SELECT history_id FROM mailbox").fetchone()
@@ -191,6 +296,51 @@ class NotificationTests(unittest.TestCase):
 
 
 class PushTests(unittest.TestCase):
+    def test_quota_failure_puts_mailbox_in_distributed_cooldown(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            with history_state(path) as connection:
+                repository = MailboxRepository(connection)
+                with patch(
+                    "gmail_subscriber.services._process_notification_with_repository",
+                    side_effect=GmailQuotaExceeded("quota"),
+                ) as process:
+                    with self.assertRaises(GmailQuotaExceeded):
+                        process_notification(
+                            MagicMock(),
+                            "user@example.com",
+                            "15",
+                            repository,
+                        )
+                    with self.assertRaises(GmailProcessingBusy):
+                        process_notification(
+                            MagicMock(),
+                            "user@example.com",
+                            "15",
+                            repository,
+                        )
+                    process.assert_called_once()
+
+    def test_database_lease_excludes_another_owner(self):
+        from gmail_subscriber.repositories import MailboxRepository
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            with history_state(path) as connection:
+                repository = MailboxRepository(connection)
+                self.assertTrue(
+                    repository.acquire_processing_lease("user@example.com", "first")
+                )
+                self.assertFalse(
+                    repository.acquire_processing_lease("user@example.com", "second")
+                )
+                repository.release_processing_lease("user@example.com", "first")
+                self.assertTrue(
+                    repository.acquire_processing_lease("user@example.com", "second")
+                )
+
     def test_gmail_service_calls_are_serialized(self):
         service = GmailSubscriberService(
             repository=MagicMock(), gmail_service=MagicMock()
@@ -243,6 +393,20 @@ class PushTests(unittest.TestCase):
         self.assertTrue(second_entered.is_set())
         self.assertEqual(maximum_active_calls, 1)
 
+    def test_playwright_can_select_decline_without_selecting_accept(self):
+        from form_automation.services import _find_response_button
+
+        page = MagicMock()
+        decline_button = MagicMock()
+        page.get_by_role.return_value = decline_button
+        decline_button.count.return_value = 1
+        decline_button.first.is_visible.return_value = True
+
+        found = _find_response_button(page, "decline")
+
+        self.assertIs(found, decline_button.first)
+        self.assertEqual(page.get_by_role.call_args.kwargs["name"].pattern, "^decline$")
+
     def test_service_provider_reuses_service(self):
         from gmail_subscriber.dependencies import get_gmail_service
 
@@ -261,7 +425,7 @@ class PushTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DATABASE_URL"), history_state():
                 self.fail("Must not fall back to ephemeral SQLite")
 
-    def test_postgres_transactions_are_short_lived(self):
+    def test_postgres_schema_creation_is_serialized_in_short_transaction(self):
         with (
             patch("gmail_subscriber.repositories.GmailSettings") as settings,
             patch("gmail_subscriber.repositories.psycopg.connect") as connect,
@@ -275,11 +439,8 @@ class PushTests(unittest.TestCase):
                 history_state(),
             ):
                 raise RuntimeError("processing failed")
-            self.assertFalse(
-                any(
-                    "advisory_lock" in str(call)
-                    for call in connection.execute.call_args_list
-                )
+            connection.execute.assert_any_call(
+                "SELECT pg_advisory_xact_lock(%s)", (724938202,)
             )
             connection.rollback.assert_called_once()
             connection.commit.assert_called_once()
@@ -333,7 +494,7 @@ class PushTests(unittest.TestCase):
         data = base64.b64encode(
             json.dumps({"emailAddress": "user@example.com", "historyId": "15"}).encode()
         ).decode()
-        envelope = {"message": {"data": data}}
+        envelope = {"message": {"data": data, "messageId": "pubsub-123"}}
         headers = {"Authorization": "Bearer token"}
         with (
             patch(
@@ -352,15 +513,40 @@ class PushTests(unittest.TestCase):
                 401,
             )
             verify.side_effect = None
-            self.assertEqual(
-                client.post(
+            with self.assertLogs("gmail_subscriber.endpoints", level="INFO") as logs:
+                response = client.post(
                     "/gmail-subscriber/push", json=envelope, headers=headers
-                ).status_code,
-                204,
+                )
+            self.assertEqual(response.status_code, 204)
+            self.assertTrue(
+                any(
+                    "Received authenticated Pub/Sub delivery pubsub-123" in log
+                    for log in logs.output
+                )
+            )
+            self.assertTrue(
+                any(
+                    "Acknowledging Pub/Sub delivery pubsub-123 with HTTP 204" in log
+                    for log in logs.output
+                )
             )
             service.process_notification.assert_called_once_with(
                 "user@example.com", "15"
             )
+            service.process_notification.side_effect = GmailQuotaExceeded("quota")
+            quota_response = client.post(
+                "/gmail-subscriber/push", json=envelope, headers=headers
+            )
+            self.assertEqual(quota_response.status_code, 503)
+            self.assertEqual(quota_response.headers["retry-after"], "60")
+            service.process_notification.side_effect = None
+            service.process_notification.side_effect = GmailProcessingBusy("busy")
+            busy_response = client.post(
+                "/gmail-subscriber/push", json=envelope, headers=headers
+            )
+            self.assertEqual(busy_response.status_code, 503)
+            self.assertEqual(busy_response.headers["retry-after"], "30")
+            service.process_notification.side_effect = None
             service.process_notification.reset_mock()
             urlsafe_data = (
                 base64.urlsafe_b64encode(
@@ -481,9 +667,7 @@ class DacInviteTests(unittest.TestCase):
     def test_ignores_pixel_only_body(self):
         self.assertIsNone(
             parse_dac_invite(
-                dac_raw_email(
-                    body='<img src="http://email.dacrsc.com/o/xyz789">'
-                )
+                dac_raw_email(body='<img src="http://email.dacrsc.com/o/xyz789">')
             )
         )
 

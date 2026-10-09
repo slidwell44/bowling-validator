@@ -129,6 +129,22 @@ Register the watch on the deployed endpoint so its cursor is stored in Neon.
 The application creates these tables automatically in the configured database:
 
 - `mailbox` stores the Gmail history cursor for the watched mailbox.
+- `history_sync_checkpoints` stores the current history start ID and next-page
+  token so a quota retry resumes at the page that failed instead of rereading
+  earlier pages.
+- `history_sync_checkpoints` stores the current Gmail history pagination token.
+  If Gmail rate-limits a multi-page sync, the next Pub/Sub retry resumes at the
+  saved page instead of rereading earlier history pages.
+- `inspected_messages` remembers Gmail messages already fetched while processing
+  history. This prevents Pub/Sub retries from rereading the same unrelated or
+  already-processed inbox messages.
+- `mailbox_processing_leases` coordinates push processing across app replicas.
+  It also holds a short cooldown after Gmail quota exhaustion, so retries do not
+  immediately issue another Gmail request from a different replica.
+- `accepted_invites` reserves each event date uniquely and records the source
+  message and acceptance status. A pending reservation is retained if the
+  browser result is ambiguous; review it before manually clearing it to avoid
+  accepting the same date twice.
 - `processed_messages` stores each successfully processed substitute-bowler
   request, including its Gmail message ID, mailbox, subject, body, history ID,
   and processing timestamp. The message ID is unique, so Pub/Sub retries do
@@ -142,6 +158,14 @@ FROM processed_messages
 ORDER BY processed_at DESC;
 ```
 
+Review accepted or reserved event dates:
+
+```sql
+SELECT event_date, message_id, status, accepted_at
+FROM accepted_invites
+ORDER BY event_date DESC;
+```
+
 ## Behavior and recovery
 
 The watch observes new `INBOX` messages. The application logs the body when the
@@ -150,9 +174,17 @@ case-insensitively. It prefers plain text and falls back to HTML source.
 Pub/Sub notifications contain mailbox history, not the email subject, so
 Pub/Sub filters cannot filter by subject or body.
 
-HTTP 204 acknowledges a notification. Non-success responses cause Pub/Sub to
-retry. PostgreSQL preserves the cursor across deployments and serializes
-concurrent deliveries.
+HTTP 204 acknowledges a notification. Gmail quota exhaustion returns HTTP 503
+with `Retry-After: 60`, allowing Pub/Sub to back off and retry. Only one replica
+processes a mailbox at a time; quota errors place that mailbox in a 60-second
+database-backed cooldown. Successfully inspected messages are skipped during
+retries, and PostgreSQL cursor updates cannot move backward. PostgreSQL
+preserves the cursor across deployments.
+
+DAC invite automation requires Playwright Chromium in the deployed runtime. The
+notification handler only clicks Accept; it never follows the open-tracking
+pixel or clicks Decline. A separate `decline_invite` helper is available for an
+explicit test and is not used during normal notification processing.
 
 If Gmail history expires, reset the cursor intentionally with matching cloud
 credentials:
