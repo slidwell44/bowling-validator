@@ -12,6 +12,7 @@ from email.parser import BytesParser
 from threading import RLock
 from typing import TYPE_CHECKING
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
 from google.oauth2.credentials import Credentials
@@ -30,6 +31,14 @@ from scripts.oauth import SCOPES, TOKEN_FILE
 if TYPE_CHECKING:
     from googleapiclient._apis.gmail.v1 import GmailResource
     from googleapiclient._apis.gmail.v1.schemas import Label, ListLabelsResponse
+
+
+class GmailAuthorizationExpired(RuntimeError):
+    """The stored Gmail OAuth refresh token was revoked or expired.
+
+    Re-authorize locally with `uv run python -m scripts.oauth` and update
+    the GMAIL_TOKEN_JSON secret with the new gmail-token.json contents.
+    """
 
 
 class GmailSubscriberService:
@@ -69,7 +78,15 @@ class GmailSubscriberService:
             )
         if credentials.expired:
             logger.info("Refreshing expired Gmail OAuth token")
-            credentials.refresh(Request())
+            try:
+                credentials.refresh(Request())
+            except RefreshError as exc:
+                logger.error("Gmail OAuth refresh token rejected: %s", exc)
+                raise GmailAuthorizationExpired(
+                    "Gmail authorization expired or was revoked. Run "
+                    "`uv run python -m scripts.oauth` and update the "
+                    "GMAIL_TOKEN_JSON secret."
+                ) from exc
         return credentials
 
     @staticmethod
@@ -364,8 +381,6 @@ def _process_notification_with_repository(
                 ):
                     continue
                 seen.add(message_id)
-                if repository.was_message_inspected(email, message_id):
-                    continue
                 try:
                     message = (
                         gmail.users()
@@ -375,7 +390,6 @@ def _process_notification_with_repository(
                     )
                 except HttpError as exc:
                     if exc.resp.status == 404:
-                        repository.mark_message_inspected(email, message_id)
                         continue  # The message was deleted before delivery.
                     if is_gmail_quota_error(exc):
                         raise GmailQuotaExceeded(
@@ -389,57 +403,62 @@ def _process_notification_with_repository(
                         message_id,
                         subject,
                     )
-                if is_relevant_subject(subject):
-                    inserted = repository.record_processed_message(
-                        message_id, email, subject, body, history_id
+                    continue
+                inserted = repository.record_processed_message(
+                    message_id, email, subject, body, history_id
+                )
+                if not inserted:
+                    logger.info(
+                        "Skipping already processed message %s; "
+                        "Pub/Sub redelivery or overlapping history",
+                        message_id,
                     )
-                    if inserted:
-                        print(
-                            f"\n--- Gmail message {message_id}: {subject} ---\n{body}\n",
-                            flush=True,
+                    continue
+                print(
+                    f"\n--- Gmail message {message_id}: {subject} ---\n{body}\n",
+                    flush=True,
+                )
+                invite = parse_dac_invite_content(
+                    _message_header(message, "from"), subject, body
+                )
+                if invite is not None:
+                    invite_url, event_date = invite
+                    if not is_acceptable_date(event_date):
+                        logger.info(
+                            "Skipping DAC invite for past date %s (%s)",
+                            event_date,
+                            message_id,
                         )
-                    invite = parse_dac_invite_content(
-                        _message_header(message, "from"), subject, body
-                    )
-                    if invite is not None:
-                        invite_url, event_date = invite
-                        if not is_acceptable_date(event_date):
-                            logger.info(
-                                "Skipping DAC invite for past date %s (%s)",
-                                event_date,
-                                message_id,
-                            )
-                        elif repository.was_invite_accepted(event_date.isoformat()):
-                            logger.info(
-                                "DAC invite date %s already reserved or accepted; "
-                                "skipping message %s",
-                                event_date,
-                                message_id,
-                            )
-                        elif not repository.reserve_invite_date(
-                            event_date.isoformat(), message_id
-                        ):
-                            logger.info(
-                                "Another invite already reserved date %s; skipping %s",
-                                event_date,
-                                message_id,
+                    elif repository.was_invite_accepted(event_date.isoformat()):
+                        logger.info(
+                            "DAC invite date %s already reserved or accepted; "
+                            "skipping message %s",
+                            event_date,
+                            message_id,
+                        )
+                    elif not repository.reserve_invite_date(
+                        event_date.isoformat(), message_id
+                    ):
+                        logger.info(
+                            "Another invite already reserved date %s; skipping %s",
+                            event_date,
+                            message_id,
+                        )
+                    else:
+                        logger.info(
+                            "Auto-accepting DAC invite for %s (%s)",
+                            event_date,
+                            message_id,
+                        )
+                        if accept_invite(invite_url):
+                            repository.record_accepted_invite(
+                                event_date.isoformat(), message_id
                             )
                         else:
-                            logger.info(
-                                "Auto-accepting DAC invite for %s (%s)",
-                                event_date,
-                                message_id,
+                            raise RuntimeError(
+                                f"DAC invite {message_id} accepted-click did "
+                                "not confirm; leaving cursor so delivery retries"
                             )
-                            if accept_invite(invite_url):
-                                repository.record_accepted_invite(
-                                    event_date.isoformat(), message_id
-                                )
-                            else:
-                                raise RuntimeError(
-                                    f"DAC invite {message_id} accepted-click did "
-                                    "not confirm; leaving cursor so delivery retries"
-                                )
-                repository.mark_message_inspected(email, message_id)
         next_page_token = page.get("nextPageToken")
         if next_page_token:
             repository.save_history_checkpoint(email, start_history_id, next_page_token)

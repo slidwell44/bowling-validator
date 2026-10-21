@@ -14,7 +14,7 @@ def get_gmail_service():
 
 
 def provide_mailbox_repository() -> Iterator[MailboxRepository]:
-    with MailboxRepository.from_settings() as repository:
+    with MailboxRepository.from_settings(create_schema=False) as repository:
         yield repository
 
 

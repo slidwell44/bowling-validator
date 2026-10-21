@@ -69,13 +69,13 @@ def require_admin(token: Annotated[str, Depends(bearer_token)]):
         raise HTTPException(403, "Invalid admin token")
 
 
-@router.get("/health/db")
+@router.get("/health/db", dependencies=[Depends(require_admin)])
 def database_health():
-    """Unauthenticated liveness probe for the configured database.
+    """Admin-only diagnostics for the configured database.
 
     Returns the backend, the tables that exist, and whether DATABASE_URL is
     configured so a missing secret or unreachable Neon is visible without
-    reading logs.
+    reading logs. Requires the GMAIL_ADMIN_TOKEN bearer token.
     """
     from gmail_subscriber.dependencies import provide_mailbox_repository
 

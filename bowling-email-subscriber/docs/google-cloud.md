@@ -52,6 +52,7 @@ Configure these application secrets and variables:
 | `GMAIL_PUSH_SERVICE_ACCOUNT` | `gmail-push@bowling-subscriber.iam.gserviceaccount.com` |
 | `GMAIL_WATCH_AUDIENCE` | `https://bowling-email-subscriber.fastapicloud.dev/gmail-subscriber/watch` |
 | `GMAIL_WATCH_SERVICE_ACCOUNT` | `gmail-watch@bowling-subscriber.iam.gserviceaccount.com` |
+| `LOGFIRE_TOKEN` | Logfire write token (enables tracing/metrics in production) |
 
 Optionally configure `GMAIL_ADMIN_TOKEN` to protect the HTTP labels endpoint.
 Do not commit or paste OAuth tokens or database URLs.
@@ -135,9 +136,6 @@ The application creates these tables automatically in the configured database:
 - `history_sync_checkpoints` stores the current Gmail history pagination token.
   If Gmail rate-limits a multi-page sync, the next Pub/Sub retry resumes at the
   saved page instead of rereading earlier history pages.
-- `inspected_messages` remembers Gmail messages already fetched while processing
-  history. This prevents Pub/Sub retries from rereading the same unrelated or
-  already-processed inbox messages.
 - `mailbox_processing_leases` coordinates push processing across app replicas.
   It also holds a short cooldown after Gmail quota exhaustion, so retries do not
   immediately issue another Gmail request from a different replica.
@@ -148,7 +146,9 @@ The application creates these tables automatically in the configured database:
 - `processed_messages` stores each successfully processed substitute-bowler
   request, including its Gmail message ID, mailbox, subject, body, history ID,
   and processing timestamp. The message ID is unique, so Pub/Sub retries do
-  not create duplicate history rows or duplicate body output.
+  not create duplicate history rows or duplicate body output. Messages whose
+  subject does not match a substitute-bowler request are never written to the
+  database, which keeps Neon compute and storage usage minimal.
 
 You can inspect the history from Neon SQL Editor:
 
@@ -177,8 +177,9 @@ Pub/Sub filters cannot filter by subject or body.
 HTTP 204 acknowledges a notification. Gmail quota exhaustion returns HTTP 503
 with `Retry-After: 60`, allowing Pub/Sub to back off and retry. Only one replica
 processes a mailbox at a time; quota errors place that mailbox in a 60-second
-database-backed cooldown. Successfully inspected messages are skipped during
-retries, and PostgreSQL cursor updates cannot move backward. PostgreSQL
+database-backed cooldown. Already-processed requests are skipped during retries
+(their message ID already exists in `processed_messages`), unrelated mail leaves
+no database rows, and PostgreSQL cursor updates cannot move backward. PostgreSQL
 preserves the cursor across deployments.
 
 DAC invite automation requires Playwright Chromium in the deployed runtime. The
