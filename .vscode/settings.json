@@ -20,5 +20,6 @@
             "source.fixAll.ruff": "always",
             "source.organizeImports.ruff": "always"
         }
-    }
+    },
+    "python.analysis.diagnosticsSource": "Pylance + Pyrefly"
 }

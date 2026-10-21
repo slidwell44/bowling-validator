@@ -56,12 +56,6 @@ class MailboxRepository:
             "processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         self.connection.execute(
-            "CREATE TABLE IF NOT EXISTS inspected_messages "
-            "(mailbox_email TEXT NOT NULL, message_id TEXT NOT NULL, "
-            "inspected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-            "PRIMARY KEY (mailbox_email, message_id))"
-        )
-        self.connection.execute(
             "CREATE TABLE IF NOT EXISTS accepted_invites "
             "(message_id TEXT PRIMARY KEY, accepted_at TEXT NOT NULL, "
             "event_date TEXT, status TEXT NOT NULL DEFAULT 'accepted')"
@@ -98,7 +92,7 @@ class MailboxRepository:
 
     @classmethod
     @contextmanager
-    def from_settings(cls, path=STATE_FILE):
+    def from_settings(cls, path=STATE_FILE, create_schema: bool = True):
         settings = GmailSettings()
         database_url = settings.DATABASE_URL
         if settings.TOKEN_JSON and not database_url:
@@ -110,11 +104,12 @@ class MailboxRepository:
         )
         try:
             repository = cls(connection)
-            if database_url:
-                connection.execute(
-                    "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_ID,)
-                )
-            repository.create_tables()
+            if create_schema:
+                if database_url:
+                    connection.execute(
+                        "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_ID,)
+                    )
+                repository.create_tables()
             connection.commit()
             yield repository
             connection.commit()
@@ -218,23 +213,6 @@ class MailboxRepository:
             (message_id, mailbox_email, subject, body, history_id),
         )
         return bool(result.rowcount)
-
-    def was_message_inspected(self, mailbox_email: str, message_id: str) -> bool:
-        return (
-            self._execute(
-                "SELECT 1 FROM inspected_messages "
-                "WHERE mailbox_email = ? AND message_id = ?",
-                (mailbox_email, message_id),
-            ).fetchone()
-            is not None
-        )
-
-    def mark_message_inspected(self, mailbox_email: str, message_id: str) -> None:
-        self._execute(
-            "INSERT INTO inspected_messages (mailbox_email, message_id) "
-            "VALUES (?, ?) ON CONFLICT (mailbox_email, message_id) DO NOTHING",
-            (mailbox_email, message_id),
-        )
 
     def was_invite_accepted(self, event_date: str) -> bool:
         return (

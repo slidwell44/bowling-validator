@@ -54,6 +54,17 @@ class GmailSettings(BaseSettings):
     ADMIN_TOKEN: SecretStr | None = None
 
 
+class LogfireSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="LOGFIRE_",
+        extra="ignore",
+    )
+
+    TOKEN: SecretStr | None = None
+
+
 class Settings(BaseModel):
     app: ApplicationSettings = Field(default_factory=ApplicationSettings)
     google: GoogleSettings = Field(default_factory=GoogleSettings)

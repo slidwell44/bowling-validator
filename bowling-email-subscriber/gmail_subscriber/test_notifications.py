@@ -194,16 +194,14 @@ class NotificationTests(unittest.TestCase):
                     "15",
                 ),
             )
-            inspected = state.execute(
-                "SELECT mailbox_email, message_id FROM inspected_messages"
-            ).fetchone()
-            self.assertEqual(inspected, ("user@example.com", "one"))
 
-    def test_retry_skips_messages_already_inspected(self):
+    def test_retry_skips_messages_already_processed(self):
         with history_state(self.path) as state:
             state.execute(
-                "INSERT INTO inspected_messages (mailbox_email, message_id) "
-                "VALUES ('user@example.com', 'one')"
+                "INSERT INTO processed_messages "
+                "(message_id, mailbox_email, subject, body, history_id) "
+                "VALUES ('one', 'user@example.com', 'Substitute bowler request', "
+                "'body', '12')"
             )
         self.gmail.users().history().list().execute.return_value = {
             "history": [
@@ -214,7 +212,34 @@ class NotificationTests(unittest.TestCase):
 
         process_notification(self.gmail, "user@example.com", "15", path=self.path)
 
-        self.gmail.users().messages().get.assert_not_called()
+        with history_state(self.path) as state:
+            row = state.execute(
+                "SELECT COUNT(*) FROM processed_messages WHERE message_id = 'one'"
+            ).fetchone()
+            self.assertEqual(row[0], 1)
+
+    def test_irrelevant_message_writes_nothing(self):
+        self.gmail.users().history().list().execute.return_value = {
+            "history": [
+                {"messagesAdded": [{"message": {"id": "junk", "labelIds": ["INBOX"]}}]}
+            ],
+            "historyId": "20",
+        }
+        self.gmail.users().messages().get().execute.return_value = api_message(
+            subject="Your receipt for October"
+        )
+
+        process_notification(self.gmail, "user@example.com", "15", path=self.path)
+
+        with history_state(self.path) as state:
+            processed = state.execute(
+                "SELECT COUNT(*) FROM processed_messages"
+            ).fetchone()
+            self.assertEqual(processed[0], 0)
+            invites = state.execute("SELECT COUNT(*) FROM accepted_invites").fetchone()
+            self.assertEqual(invites[0], 0)
+            cursor = state.execute("SELECT history_id FROM mailbox").fetchone()
+            self.assertEqual(cursor[0], "20")
 
     def test_history_retry_resumes_from_saved_page_after_quota_error(self):
         from gmail_subscriber.repositories import MailboxRepository
